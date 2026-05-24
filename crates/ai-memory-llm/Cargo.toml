@@ -20,6 +20,7 @@ tokio.workspace = true
 tracing.workspace = true
 reqwest.workspace = true
 async-trait.workspace = true
+regex.workspace = true
 
 [dev-dependencies]
 tokio = { workspace = true }

@@ -449,6 +449,11 @@ pub struct LintArgs {
     /// Compute findings but don't write `wiki/_lint/<date>.md`.
     #[arg(long)]
     pub dry_run: bool,
+    /// Run only rule-based checks; skip the LLM contradiction pass.
+    /// Lets you get fast results without consuming LLM tokens when a
+    /// provider is configured.
+    #[arg(long)]
+    pub no_llm: bool,
     /// Workspace name (auto-created if absent).
     #[arg(long, default_value = "default")]
     pub workspace: String,

@@ -150,6 +150,7 @@ dependencies = [
  "ai-memory-core",
  "anyhow",
  "async-trait",
+ "regex",
  "reqwest",
  "schemars",
  "secrecy",

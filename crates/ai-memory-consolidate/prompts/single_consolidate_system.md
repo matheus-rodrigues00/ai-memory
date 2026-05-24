@@ -61,5 +61,8 @@ schema, and nothing else:
 - Reply with ONE JSON object, nothing else. NO prose preamble,
   NO trailing commentary, NO ``` code fences. The first
   character of your reply must be `{`, the last `}`.
+- Do NOT emit `<think>`, `<reasoning>`, `<analysis>`, or any
+  other reasoning/analysis blocks, markdown fences, or prose —
+  the entire reply is the JSON object.
 - Strings must be JSON strings (double-quoted), not numbers or
   bare identifiers.

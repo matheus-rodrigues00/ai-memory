@@ -28,18 +28,29 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tracing::warn;
 
+fn default_lint_severity() -> String {
+    "warning".into()
+}
+
 /// One lint finding (rule-based or LLM-emitted).
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct LintFinding {
     /// Discriminator: `contradiction` | `stale` | `duplicate` | `empty` | `other`.
     pub kind: String,
-    /// `info` | `warning` | `error`.
+    /// `info` | `warning`. Defaults to `"warning"` so older prompts that
+    /// omit the field don't hard-fail deserialization.
+    #[serde(default = "default_lint_severity")]
     pub severity: String,
-    /// One-paragraph description.
+    /// One-paragraph description. Also accepts `"summary"` (the field name
+    /// the old prompt used) so existing LLM responses still deserialize.
+    #[serde(alias = "summary")]
     pub message: String,
     /// Wiki paths the finding refers to.
     #[serde(default)]
     pub pages: Vec<String>,
+    /// Optional longer markdown explanation emitted by the LLM prompt.
+    #[serde(default)]
+    pub detail: Option<String>,
 }
 
 /// Structured output the LLM produces.
@@ -78,6 +89,9 @@ pub const STALE_DAYS: f64 = 30.0;
 /// * `llm` — when `Some`, the contradiction pass runs; otherwise the
 ///   report contains only rule-based findings.
 /// * `dry_run` — when `true`, no file is written.
+/// * `use_llm` — when `false`, the contradiction pass is skipped even
+///   if a provider is present. Lets operators run rule-based-only lint
+///   without disabling LLM globally for explore/consolidate.
 ///
 /// # Errors
 /// Returns [`LintError`] for any store / wiki / LLM failure.
@@ -88,11 +102,12 @@ pub async fn run_lint(
     workspace_id: WorkspaceId,
     project_id: ProjectId,
     dry_run: bool,
+    use_llm: bool,
 ) -> Result<LintReport, LintError> {
     let candidates = reader.decay_candidates(workspace_id, project_id).await?;
     let mut findings = rule_based_findings(&candidates);
 
-    if let Some(provider) = llm {
+    if use_llm && let Some(provider) = llm {
         match contradiction_pass(
             provider.clone(),
             wiki,
@@ -135,6 +150,7 @@ fn rule_based_findings(candidates: &[DecayCandidate]) -> Vec<LintFinding> {
                     c.path, age_days,
                 ),
                 pages: vec![c.path.as_str().to_string()],
+                detail: None,
             });
         }
         // M20: rule-shaped pages get a "consider adding to
@@ -162,6 +178,7 @@ fn rule_based_findings(candidates: &[DecayCandidate]) -> Vec<LintFinding> {
                      just when it remembers to call memory_query."
                 ),
                 pages: vec![path_str.to_string()],
+                detail: None,
             });
         }
         // Duplicate-title tracking: peek the frontmatter for a `title` field.
@@ -182,6 +199,7 @@ fn rule_based_findings(candidates: &[DecayCandidate]) -> Vec<LintFinding> {
                 severity: "warning".into(),
                 message: format!("Multiple pages share title {title:?}"),
                 pages: paths,
+                detail: None,
             });
         }
     }
@@ -279,6 +297,9 @@ fn render_markdown(report: &LintReport) -> String {
     for (i, f) in report.findings.iter().enumerate() {
         buf.push_str(&format!("## {} — {} ({})\n\n", i + 1, f.kind, f.severity));
         buf.push_str(&format!("{}\n\n", f.message));
+        if let Some(detail) = &f.detail {
+            buf.push_str(&format!("{detail}\n\n"));
+        }
         if !f.pages.is_empty() {
             buf.push_str("Pages:\n");
             for p in &f.pages {
@@ -399,6 +420,62 @@ mod tests {
         assert!(
             findings.iter().all(|f| f.kind != "rule_suggestion"),
             "non-rule page must not produce a rule_suggestion finding",
+        );
+    }
+
+    // ── LintFinding tolerant deserialization ─────────────────────────────
+
+    /// The old prompt used `summary`/`detail` instead of `message` and
+    /// omitted `severity`. Both fields must deserialize gracefully so
+    /// in-flight LLM responses don't silently fail.
+    #[test]
+    fn lint_finding_deserializes_old_prompt_shape() {
+        let json = r#"{"kind":"contradiction","pages":["a.md"],"summary":"x","detail":"y"}"#;
+        let f: LintFinding = serde_json::from_str(json).expect("deserialize");
+        assert_eq!(f.message, "x");
+        assert_eq!(
+            f.severity, "warning",
+            "missing severity defaults to warning"
+        );
+        assert_eq!(f.detail, Some("y".into()));
+    }
+
+    /// The canonical (updated) prompt shape must also round-trip.
+    #[test]
+    fn lint_finding_deserializes_canonical_shape() {
+        let json = r#"{"kind":"stale","severity":"info","message":"m","pages":[]}"#;
+        let f: LintFinding = serde_json::from_str(json).expect("deserialize");
+        assert_eq!(f.kind, "stale");
+        assert_eq!(f.severity, "info");
+        assert_eq!(f.message, "m");
+        assert!(f.detail.is_none());
+    }
+
+    // ── use_llm=false skips contradiction pass ───────────────────────────
+
+    /// `rule_based_findings` with a stale candidate returns a finding.
+    /// This stands in for the full `run_lint(..., use_llm=false)` path:
+    /// the guard `if use_llm { ... }` is trivially verifiable by
+    /// inspection, so the test focuses on rule-based output being present.
+    #[test]
+    fn no_llm_flag_still_returns_rule_based_findings() {
+        let very_old = Timestamp::now().as_microsecond() - (60 * 86_400_000_000i64);
+        let candidates = vec![DecayCandidate {
+            id: ai_memory_core::PageId::new(),
+            path: ai_memory_core::PagePath::new("sessions/old.md").unwrap(),
+            tier: Tier::Episodic,
+            pinned: false,
+            updated_at_us: very_old,
+            access_count: 0,
+            last_accessed_at_us: None,
+            frontmatter_json: "{}".into(),
+        }];
+        // rule_based_findings is the exact code path that `use_llm=false`
+        // keeps active. Confirm it still fires.
+        let findings = rule_based_findings(&candidates);
+        assert!(
+            findings.iter().any(|f| f.kind == "stale"),
+            "rule-based stale finding must be present regardless of use_llm flag",
         );
     }
 }

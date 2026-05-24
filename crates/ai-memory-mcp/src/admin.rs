@@ -775,6 +775,11 @@ struct LintRequest {
     /// Don't write the lint report page.
     #[serde(default)]
     dry_run: bool,
+    /// Skip the LLM contradiction pass (rule-based findings only).
+    /// When absent, defaults to `false` (LLM pass runs if a provider
+    /// is configured).
+    #[serde(default)]
+    no_llm: bool,
 }
 
 fn default_workspace() -> String {
@@ -798,6 +803,7 @@ async fn handle_lint(
         ws,
         proj,
         req.dry_run,
+        !req.no_llm,
     )
     .await
     .map(|report| {

@@ -378,6 +378,7 @@ async fn m8_retention_lifecycle_end_to_end() {
         ws,
         proj,
         /* dry_run */ true,
+        /* use_llm */ true,
     )
     .await
     .expect("lint dry-run");

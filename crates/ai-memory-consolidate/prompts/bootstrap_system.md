@@ -78,5 +78,8 @@ Reply with ONE JSON object matching this exact schema:
   NO trailing commentary, NO ``` code fences, NO markdown
   headers wrapping the JSON. The very first character of your
   reply must be `{` and the very last `}`.
+- Do NOT emit `<think>`, `<reasoning>`, `<analysis>`, or any
+  other reasoning/analysis blocks, markdown fences, or prose —
+  the entire reply is the JSON object.
 - Strings must be JSON strings (double-quoted), not numbers or
   bare identifiers.

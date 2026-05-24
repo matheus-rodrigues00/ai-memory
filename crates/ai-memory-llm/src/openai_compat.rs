@@ -6,7 +6,10 @@
 //! object out of the text" because most local engines lack reliable
 //! `response_format` honour.
 
+use std::sync::LazyLock;
+
 use async_trait::async_trait;
+use regex::Regex;
 use secrecy::SecretString;
 use tracing::debug;
 
@@ -14,6 +17,39 @@ use crate::error::{LlmError, LlmResult};
 use crate::openai::OpenAiProvider;
 use crate::provider::LlmProvider;
 use crate::types::{ChatRequest, ChatResponse};
+
+// Compiled once. Matches <think>, <thinking>, <analysis>, <reasoning> blocks
+// (case-insensitive, non-greedy, DOTALL) that reasoning models emit before
+// the JSON payload. These blocks often contain `{` braces that confuse the
+// balanced-brace extractor when unstripped.
+//
+// Each tag is listed explicitly because the `regex` crate does not support
+// backreferences — we cannot write `<(tag)>.*?</\1>`.
+static REASONING_BLOCK_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(
+        r"(?is)(?:<think>.*?</think>|<thinking>.*?</thinking>|<analysis>.*?</analysis>|<reasoning>.*?</reasoning>)",
+    )
+    .unwrap()
+});
+
+// Matches an outermost ```json ... ``` or ``` ... ``` markdown fence.
+static CODE_FENCE_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(?s)\A\s*```(?:json)?\s*\n(.*?)\n\s*```\s*\z").unwrap());
+
+/// Remove `<think>`, `<thinking>`, `<analysis>`, and `<reasoning>` blocks
+/// (case-insensitive) from `s`, then unwrap any surrounding markdown code
+/// fence. Returns a freshly allocated `String` so the caller can choose
+/// between the cleaned and the raw form.
+pub(crate) fn strip_reasoning_blocks(s: &str) -> String {
+    let stripped = REASONING_BLOCK_RE.replace_all(s, "");
+    // If the entire remaining payload is wrapped in a code fence, unwrap it
+    // so `serde_json::from_str` can see the bare JSON directly.
+    if let Some(caps) = CODE_FENCE_RE.captures(stripped.as_ref()) {
+        caps[1].trim().to_string()
+    } else {
+        stripped.trim().to_string()
+    }
+}
 
 /// OpenAI-compatible provider, parameterised by base URL.
 pub struct OpenAiCompatProvider {
@@ -65,22 +101,27 @@ impl LlmProvider for OpenAiCompatProvider {
         // ask the model to emit a JSON object and fall back to
         // extracting the first balanced `{…}` from the text.
         let res = self.inner.complete(request).await?;
-        match serde_json::from_str::<serde_json::Value>(&res.text) {
+        // Reasoning models (DeepSeek, Qwen, MiniMax M2.7, …) prepend
+        // `<think>…</think>` before the JSON. Strip those blocks (and any
+        // surrounding markdown fences) before trying to parse — otherwise
+        // `first_json_object` latches onto a `{` inside the reasoning text.
+        let cleaned = strip_reasoning_blocks(&res.text);
+        match serde_json::from_str::<serde_json::Value>(&cleaned) {
             Ok(v) if v.is_object() => Ok(v),
             _ => {
-                let Some(slice) = first_json_object(&res.text) else {
+                let Some(slice) = first_json_object(&cleaned) else {
                     // Dump enough text to actually see what the model
                     // returned. 200 chars truncates inside code fences;
                     // 4 KB tells the full story for any reasonable
                     // structured-output response. Includes head + tail
                     // because some failures truncate the closing brace.
-                    let head = truncate(&res.text, 2000);
-                    let tail_start = res.text.len().saturating_sub(2000);
-                    let tail = &res.text[tail_start..];
+                    let head = truncate(&cleaned, 2000);
+                    let tail_start = cleaned.len().saturating_sub(2000);
+                    let tail = &cleaned[tail_start..];
                     debug!(
                         head = %head,
                         tail = %tail,
-                        total_len = res.text.len(),
+                        total_len = cleaned.len(),
                         "no balanced JSON object found"
                     );
                     return Err(LlmError::UnexpectedShape(
@@ -155,5 +196,57 @@ mod tests {
             Some("{\"a\":{\"b\":2}}"),
         );
         assert_eq!(first_json_object("no json here"), None);
+    }
+
+    // ── strip_reasoning_blocks ───────────────────────────────────────────
+
+    /// A `<think>` block whose body contains braces must be stripped so the
+    /// real JSON object is found rather than a brace inside the think text.
+    #[test]
+    fn strip_think_block_with_braces_before_json() {
+        let input = "<think>maybe {a:1} or {b:2}?</think>\n{\"findings\":[]}";
+        let cleaned = strip_reasoning_blocks(input);
+        let v: serde_json::Value =
+            serde_json::from_str(&cleaned).expect("should parse to the real JSON object");
+        assert!(v.is_object());
+        assert_eq!(v["findings"], serde_json::json!([]));
+    }
+
+    /// `<analysis>` prefix is also stripped.
+    #[test]
+    fn strip_analysis_block() {
+        let input = "<analysis>I reviewed the pages.</analysis>\n{\"key\":\"value\"}";
+        let cleaned = strip_reasoning_blocks(input);
+        let v: serde_json::Value = serde_json::from_str(&cleaned).expect("parse");
+        assert_eq!(v["key"], "value");
+    }
+
+    /// A lone ```` ```json\n{...}\n``` ```` fence is unwrapped so the JSON
+    /// is directly parseable.
+    #[test]
+    fn strip_json_code_fence() {
+        let input = "```json\n{\"answer\":42}\n```";
+        let cleaned = strip_reasoning_blocks(input);
+        let v: serde_json::Value = serde_json::from_str(&cleaned).expect("parse");
+        assert_eq!(v["answer"], 42);
+    }
+
+    /// A plain JSON object with no reasoning prefix must survive unchanged
+    /// (modulo trimming).
+    #[test]
+    fn plain_json_unchanged() {
+        let input = "{\"hello\":\"world\"}";
+        let cleaned = strip_reasoning_blocks(input);
+        assert_eq!(cleaned, input);
+    }
+
+    /// Tag matching is case-insensitive — `<THINK>` is stripped just like
+    /// `<think>`.
+    #[test]
+    fn strip_is_case_insensitive() {
+        let input = "<THINK>uppercase</THINK>\n{\"ok\":true}";
+        let cleaned = strip_reasoning_blocks(input);
+        let v: serde_json::Value = serde_json::from_str(&cleaned).expect("parse");
+        assert_eq!(v["ok"], true);
     }
 }

@@ -13,6 +13,7 @@ struct LintRequest {
     workspace: String,
     project: String,
     dry_run: bool,
+    no_llm: bool,
 }
 
 /// Run the `lint` subcommand.
@@ -30,6 +31,7 @@ pub async fn run(_config: &Config, args: LintArgs) -> Result<()> {
             workspace: args.workspace,
             project,
             dry_run: args.dry_run,
+            no_llm: args.no_llm,
         },
     )
     .await?;

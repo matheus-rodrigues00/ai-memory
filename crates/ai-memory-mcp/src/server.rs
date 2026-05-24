@@ -170,6 +170,11 @@ struct LintArgs {
     /// If true, don't write wiki/_lint/<date>.md. Default false.
     #[serde(default)]
     dry_run: Option<bool>,
+    /// If true, skip the LLM contradiction pass (rule-based only).
+    /// Useful when a provider is configured but you only want the
+    /// fast rule-based checks. Default false.
+    #[serde(default)]
+    no_llm: Option<bool>,
 }
 
 #[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
@@ -494,6 +499,7 @@ impl AiMemoryServer {
             self.workspace_id,
             self.project_id,
             args.dry_run.unwrap_or(false),
+            !args.no_llm.unwrap_or(false),
         )
         .await
         .map_err(|e| McpError::internal_error(e.to_string(), None))?;
@@ -1237,6 +1243,7 @@ mod tests {
         let err = server
             .memory_lint(Parameters(LintArgs {
                 dry_run: Some(true),
+                no_llm: None,
             }))
             .await
             .expect_err("must reject when wiki is not attached");
