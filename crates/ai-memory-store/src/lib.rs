@@ -63,10 +63,14 @@ impl Store {
         let mut conn = Connection::open(&db_path)?;
         conn.pragma_update(None, "journal_mode", "WAL")?;
         conn.pragma_update(None, "synchronous", "NORMAL")?;
-        conn.pragma_update(None, "foreign_keys", "ON")?;
         conn.pragma_update(None, "busy_timeout", 5_000)?; // ms
 
+        // SQLite cannot disable FK enforcement inside refinery's per-migration
+        // transaction. Keep it off while migrations rebuild tables, then enable
+        // it for all runtime reads/writes below.
+        conn.pragma_update(None, "foreign_keys", "OFF")?;
         migrations::run(&mut conn)?;
+        conn.pragma_update(None, "foreign_keys", "ON")?;
 
         let writer = WriterHandle::spawn(conn);
         let reader = ReaderPool::new(&db_path, READER_POOL_SOFT_CAP)?;
@@ -88,9 +92,10 @@ impl Store {
 mod tests {
     use super::*;
     use ai_memory_core::{
-        AgentKind, NewObservation, NewPage, NewSession, ObservationKind, PagePath, ProjectId,
-        SessionId, Tier, WorkspaceId,
+        AgentKind, NewObservation, NewPage, NewSession, ObservationId, ObservationKind, PagePath,
+        ProjectId, SessionId, Tier, WorkspaceId,
     };
+    use rusqlite::{Connection, params};
     use tempfile::TempDir;
 
     fn sample_page(ws: WorkspaceId, proj: ProjectId, path: &str, body: &str) -> NewPage {
@@ -168,6 +173,63 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(pa, pb);
+    }
+
+    #[tokio::test]
+    async fn v09_session_agent_kind_migration_preserves_observations() {
+        let tmp = TempDir::new().unwrap();
+        let db_dir = tmp.path().join("db");
+        std::fs::create_dir_all(&db_dir).unwrap();
+        let db_path = db_dir.join(DB_FILENAME);
+        let mut conn = Connection::open(&db_path).unwrap();
+        conn.pragma_update(None, "foreign_keys", "OFF").unwrap();
+        crate::migrations::run_to(&mut conn, 8).unwrap();
+        conn.pragma_update(None, "foreign_keys", "ON").unwrap();
+
+        let ws = WorkspaceId::new();
+        let proj = ProjectId::new();
+        let sid = SessionId::new();
+        let oid = ObservationId::new();
+        conn.execute(
+            "INSERT INTO workspaces (id, name, created_at) VALUES (?1, 'default', 1)",
+            params![ws.as_bytes()],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO projects (id, workspace_id, name, created_at) \
+             VALUES (?1, ?2, 'scratch', 1)",
+            params![proj.as_bytes(), ws.as_bytes()],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO sessions (id, workspace_id, project_id, agent_kind, started_at) \
+             VALUES (?1, ?2, ?3, 'open-code', 1)",
+            params![sid.as_bytes(), ws.as_bytes(), proj.as_bytes()],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO observations (id, session_id, workspace_id, project_id, kind, title, body, created_at) \
+             VALUES (?1, ?2, ?3, ?4, 'user_prompt', 'keep', 'this observation must survive', 1)",
+            params![oid.as_bytes(), sid.as_bytes(), ws.as_bytes(), proj.as_bytes()],
+        )
+        .unwrap();
+        drop(conn);
+
+        let store = Store::open(tmp.path()).unwrap();
+        let count = store.reader.status_counts().await.unwrap().observations;
+        assert_eq!(count, 1, "V09 must not cascade-delete observations");
+
+        store
+            .writer
+            .begin_session(NewSession {
+                id: SessionId::new(),
+                workspace_id: ws,
+                project_id: proj,
+                agent_kind: AgentKind::Cursor,
+                cwd: None,
+            })
+            .await
+            .unwrap();
     }
 
     #[tokio::test]

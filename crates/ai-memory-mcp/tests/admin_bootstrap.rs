@@ -181,6 +181,25 @@ async fn empty_sources_returns_error() {
     );
 }
 
+/// A non-empty request that gets fully pruned by an impossibly small budget is
+/// still a validation failure, not a successful no-op bootstrap.
+#[tokio::test]
+async fn fully_pruned_sources_return_error() {
+    let tmp = TempDir::new().unwrap();
+    let state = make_admin_state(&tmp).await;
+
+    let body = json!({
+        "workspace": "test-ws",
+        "project": "test-proj",
+        "sources": synthetic_sources(),
+        "max_input_tokens": 1,
+        "dry_run": true,
+    });
+
+    let resp = post_bootstrap(state, body).await;
+    assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
+}
+
 /// The workspace + project are auto-created by the handler; posting the
 /// same workspace/project a second time with `force=true` must not error
 /// (idempotent upsert).

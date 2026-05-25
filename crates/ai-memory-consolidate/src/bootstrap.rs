@@ -316,6 +316,9 @@ impl Bootstrap {
         let incoming = sources.len();
         let (kept, _prune_internal, est_tokens) =
             prune_sources_to_budget(sources, cfg.max_input_tokens);
+        if kept.is_empty() {
+            return Err(BootstrapError::NoSources);
+        }
         let (collected, sources_sent, sources_dropped) =
             bootstrap_source_counts(incoming, cfg.sources_collected, &kept);
         info!(
@@ -837,7 +840,7 @@ pub fn plan_bootstrap_chunks(
     if chunk_budget == 0 {
         return vec![sources];
     }
-    let usable = chunk_budget.saturating_sub(1_000);
+    let usable = usable_chunk_tokens(chunk_budget);
     let total: usize = sources.iter().map(BootstrapSource::estimated_tokens).sum();
     if total <= usable {
         return vec![sources];
@@ -871,6 +874,15 @@ fn chunk_sources_greedy(sources: Vec<BootstrapSource>, usable: usize) -> Vec<Vec
         chunks.push(current);
     }
     chunks
+}
+
+fn usable_chunk_tokens(chunk_budget: usize) -> usize {
+    const PROMPT_RESERVE: usize = 1_000;
+    if chunk_budget > PROMPT_RESERVE {
+        chunk_budget - PROMPT_RESERVE
+    } else {
+        chunk_budget
+    }
 }
 
 fn split_oversized_source(source: BootstrapSource, usable: usize) -> Vec<BootstrapSource> {
@@ -1263,6 +1275,21 @@ mod tests {
                 .any(|source| source.label.contains("(part 2)")),
             "split labels should identify later parts"
         );
+    }
+
+    #[test]
+    fn plan_chunks_treats_tiny_chunk_budget_as_content_budget() {
+        let source = BootstrapSource {
+            kind: SourceKind::DocFile,
+            label: "docs/huge.md".into(),
+            text: "x".repeat(10_000),
+        };
+        let chunks = plan_bootstrap_chunks(vec![source], 900);
+        assert!(chunks.len() > 1, "tiny non-zero budget should still split");
+        for chunk in &chunks {
+            let t: usize = chunk.iter().map(BootstrapSource::estimated_tokens).sum();
+            assert!(t <= 900, "chunk should respect tiny budget; got {t}");
+        }
     }
 
     #[test]

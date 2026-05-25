@@ -532,6 +532,14 @@ fn dry_run_outcome(
     }
     let incoming = sources.len();
     let (kept, _dropped, total) = prune_sources_to_budget(sources, max_input_tokens);
+    if kept.is_empty() {
+        return Err((
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(serde_json::json!({
+                "error": BootstrapError::NoSources.to_string()
+            })),
+        ));
+    }
     let collected = sources_collected.unwrap_or(incoming);
     let sources_sent = kept.len();
     let sources_dropped = collected.saturating_sub(sources_sent);

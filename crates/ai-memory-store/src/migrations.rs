@@ -10,3 +10,11 @@ pub fn run(conn: &mut rusqlite::Connection) -> Result<(), refinery::Error> {
     migrations::runner().run(conn)?;
     Ok(())
 }
+
+#[cfg(test)]
+pub(crate) fn run_to(conn: &mut rusqlite::Connection, target: u32) -> Result<(), refinery::Error> {
+    migrations::runner()
+        .set_target(refinery::Target::Version(target))
+        .run(conn)?;
+    Ok(())
+}
