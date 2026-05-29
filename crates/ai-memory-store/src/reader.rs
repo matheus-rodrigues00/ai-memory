@@ -276,6 +276,11 @@ pub struct RelatedPage {
     pub title: String,
     /// Semantic kind of the related page.
     pub kind: String,
+    /// Workspace the related page lives in. Lets a backlink from another
+    /// project be labelled / navigated (the cross-project dependency signal).
+    pub workspace: String,
+    /// Project the related page lives in.
+    pub project: String,
 }
 
 /// Resolved outgoing links and incoming back-links for one page.
@@ -2108,11 +2113,14 @@ impl ReaderPool {
                                     WHEN pg.path LIKE 'gotchas/%' THEN 'gotcha' \
                                     ELSE 'fact' \
                                 END \
-                            ) \
+                            ), \
+                            ws.name, pr.name \
                      FROM links l \
                      JOIN pages pg ON pg.id = l.to_page_id \
+                     JOIN projects pr ON pr.id = pg.project_id \
+                     JOIN workspaces ws ON ws.id = pg.workspace_id \
                      WHERE l.from_page_id = ?1 AND pg.is_latest = 1 \
-                     ORDER BY pg.path";
+                     ORDER BY ws.name, pr.name, pg.path";
             let incoming = "SELECT DISTINCT pg.path, pg.title, \
                             COALESCE( \
                                 json_extract(pg.frontmatter_json, '$.kind'), \
@@ -2122,11 +2130,14 @@ impl ReaderPool {
                                     WHEN pg.path LIKE 'gotchas/%' THEN 'gotcha' \
                                     ELSE 'fact' \
                                 END \
-                            ) \
+                            ), \
+                            ws.name, pr.name \
                      FROM links l \
                      JOIN pages pg ON pg.id = l.from_page_id \
+                     JOIN projects pr ON pr.id = pg.project_id \
+                     JOIN workspaces ws ON ws.id = pg.workspace_id \
                      WHERE l.to_page_id = ?1 AND pg.is_latest = 1 \
-                     ORDER BY pg.path";
+                     ORDER BY ws.name, pr.name, pg.path";
 
             let collect = |sql: &str| -> StoreResult<Vec<RelatedPage>> {
                 let mut stmt = conn.prepare(sql)?;
@@ -2135,6 +2146,8 @@ impl ReaderPool {
                         path: row.get(0)?,
                         title: row.get(1)?,
                         kind: row.get(2)?,
+                        workspace: row.get(3)?,
+                        project: row.get(4)?,
                     })
                 })?;
                 let mut out = Vec::new();

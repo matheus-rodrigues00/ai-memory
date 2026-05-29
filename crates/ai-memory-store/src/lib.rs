@@ -498,7 +498,7 @@ mod tests {
             .await
             .unwrap();
         let mut source = sample_page(ws, proj, "source.md", "needle source content");
-        source.links = vec![PagePath::new("target.md").unwrap()];
+        source.links = vec![PagePath::new("target.md").unwrap().into()];
         store.writer.upsert_page(source).await.unwrap();
 
         let hits = store
