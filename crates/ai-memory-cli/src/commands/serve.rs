@@ -25,7 +25,7 @@ use rmcp::transport::streamable_http_server::{
 };
 use tokio_util::sync::CancellationToken;
 use tower_http::cors::CorsLayer;
-use tower_http::services::{ServeDir, ServeFile};
+use tower_http::services::ServeDir;
 use tracing::info;
 
 use crate::auth::{AuthState, require_bearer};
@@ -279,6 +279,14 @@ pub async fn run(config: &Config, args: ServeArgs) -> Result<()> {
                 .merge(hooks)
                 .layer(DefaultBodyLimit::max(MAX_BODY_BYTES))
                 .merge(admin.layer(DefaultBodyLimit::max(BOOTSTRAP_MAX_BODY_BYTES)));
+            let base_path = normalize_prefix(&args.base_path);
+            if base_path.is_empty() && !args.base_path.trim_matches('/').trim().is_empty() {
+                tracing::warn!(
+                    raw = %args.base_path,
+                    "AI_MEMORY_BASE_PATH is not a safe path prefix; serving at root instead",
+                );
+            }
+            let base_href = web_base_href(&args.base_path, &args.web_slug);
             let router = mount_web_router(
                 router,
                 args.enable_web,
@@ -286,8 +294,18 @@ pub async fn run(config: &Config, args: ServeArgs) -> Result<()> {
                 wiki.clone(),
                 args.web_ui_dir.as_deref(),
                 &cors_origins,
+                &args.web_slug,
+                &base_href,
             );
             let router = apply_http_layers(router, auth_state, config.allowed_hosts.clone());
+            // Host the entire surface under the configured base path. Empty
+            // base = root (unchanged). The auth/host layers are already
+            // attached to `router`, so they run for every nested route.
+            let router = if base_path.is_empty() {
+                router
+            } else {
+                axum::Router::new().nest(&base_path, router)
+            };
             let listener = tokio::net::TcpListener::bind(&bind)
                 .await
                 .with_context(|| format!("binding {bind}"))?;
@@ -712,6 +730,123 @@ fn llm_retry_hint(provider: &str, model: &str, base_url: Option<&str>) -> String
     command
 }
 
+/// Normalise an operator-supplied path prefix into either `""` (root) or
+/// `/<core>` — exactly one leading slash, no trailing slash, internal
+/// empty/`//` segments collapsed. Segments are restricted to a safe path
+/// charset; anything outside it falls back to root so a malformed env var
+/// can never inject markup or a protocol-relative `//` into served HTML.
+pub(crate) fn normalize_prefix(raw: &str) -> String {
+    let segs: Vec<&str> = raw.trim().split('/').filter(|s| !s.is_empty()).collect();
+    if segs.is_empty() {
+        return String::new();
+    }
+    let safe = segs.iter().all(|s| {
+        s.chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | '~'))
+    });
+    if !safe {
+        return String::new();
+    }
+    format!("/{}", segs.join("/"))
+}
+
+/// Build the `<base href>` value (always trailing-slash-terminated, never
+/// the protocol-relative `//`) for the web UI mounted at `base_path` +
+/// `web_slug`.
+pub(crate) fn web_base_href(base_path: &str, web_slug: &str) -> String {
+    let combined = format!(
+        "{}{}",
+        normalize_prefix(base_path),
+        normalize_prefix(web_slug)
+    );
+    if combined.is_empty() {
+        "/".to_string()
+    } else {
+        format!("{combined}/")
+    }
+}
+
+/// Escape a string for safe inclusion inside a double-quoted HTML attribute.
+fn escape_attr(s: &str) -> String {
+    s.replace('&', "&amp;")
+        .replace('"', "&quot;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+}
+
+/// Inject `<base href="{href}">` immediately after the first `<head…>` tag
+/// (or prepend it when there is no head) so the served SPA's relative
+/// asset/router URLs resolve under the configured prefix.
+pub(crate) fn inject_base_href(html: &str, href: &str) -> String {
+    let tag = format!("<base href=\"{}\">", escape_attr(href));
+    if let Some(start) = html.find("<head")
+        && let Some(gt) = html[start..].find('>')
+    {
+        let pos = start + gt + 1;
+        let mut out = String::with_capacity(html.len() + tag.len());
+        out.push_str(&html[..pos]);
+        out.push_str(&tag);
+        out.push_str(&html[pos..]);
+        return out;
+    }
+    format!("{tag}{html}")
+}
+
+#[cfg(test)]
+mod web_base_tests {
+    use super::{inject_base_href, normalize_prefix, web_base_href};
+
+    #[test]
+    fn normalize_prefix_edge_cases() {
+        assert_eq!(normalize_prefix(""), "");
+        assert_eq!(normalize_prefix("/"), "");
+        assert_eq!(normalize_prefix("//"), "");
+        assert_eq!(normalize_prefix("  /  "), "");
+        assert_eq!(normalize_prefix("wiki"), "/wiki");
+        assert_eq!(normalize_prefix("/wiki"), "/wiki");
+        assert_eq!(normalize_prefix("/wiki/"), "/wiki");
+        assert_eq!(normalize_prefix("//wiki//"), "/wiki");
+        assert_eq!(normalize_prefix("/wiki/sub"), "/wiki/sub");
+        // Unsafe chars fall back to root — never inject markup or `//`.
+        assert_eq!(normalize_prefix("/wi\"ki"), "");
+        assert_eq!(normalize_prefix("/wiki space"), "");
+        assert_eq!(normalize_prefix("/<script>"), "");
+    }
+
+    #[test]
+    fn web_base_href_never_protocol_relative() {
+        assert_eq!(web_base_href("", "/web"), "/web/");
+        assert_eq!(web_base_href("/wiki", "/web"), "/wiki/web/");
+        assert_eq!(web_base_href("/wiki", "/"), "/wiki/");
+        assert_eq!(web_base_href("", "/"), "/");
+        assert_eq!(web_base_href("/", "/"), "/");
+        assert_eq!(web_base_href("/wiki/", "web"), "/wiki/web/");
+        for (b, s) in [("", "/"), ("/", "/"), ("//", "//")] {
+            assert!(!web_base_href(b, s).starts_with("//"));
+        }
+    }
+
+    #[test]
+    fn inject_base_href_after_head() {
+        let html = "<!doctype html><html><head><meta charset=\"utf-8\"></head><body></body></html>";
+        let out = inject_base_href(html, "/wiki/web/");
+        assert!(out.contains("<head><base href=\"/wiki/web/\"><meta"));
+    }
+
+    #[test]
+    fn inject_base_href_no_head_prepends() {
+        let out = inject_base_href("<html></html>", "/x/");
+        assert!(out.starts_with("<base href=\"/x/\"><html>"));
+    }
+
+    #[test]
+    fn inject_base_href_escapes_attr() {
+        let out = inject_base_href("<head></head>", "/a\"b/");
+        assert!(out.contains("<base href=\"/a&quot;b/\">"));
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 fn mount_web_router(
     router: axum::Router,
     enable_web: bool,
@@ -719,6 +854,8 @@ fn mount_web_router(
     wiki: Wiki,
     web_ui_dir: Option<&Path>,
     cors_origins: &[String],
+    web_slug: &str,
+    base_href: &str,
 ) -> axum::Router {
     if !enable_web {
         return router;
@@ -751,25 +888,55 @@ fn mount_web_router(
     };
     let router = router.nest("/api/v1", api);
 
+    // Where the UI is mounted WITHIN the (already-applied) base path.
+    // Empty slug => the UI is the root of the base path itself.
+    let slug = normalize_prefix(web_slug);
+    let mount = if slug.is_empty() { "/" } else { slug.as_str() };
+
     // Custom SPA via --web-ui-dir (SPA fallback to index.html), otherwise
-    // the built-in server-side wiki browser.
+    // the built-in server-side wiki browser. In both cases the served
+    // index carries an injected `<base href>` so relative asset/router
+    // URLs resolve under `{base_path}{web_slug}`.
     if let Some(dir) = web_ui_dir {
         let dir = dir.to_path_buf();
-        let index = dir.join("index.html");
-        info!(dir = %dir.display(), "custom web UI mounted at /web");
-        // ServeDir already answers /web and /web/ (SPA fallback to index.html);
-        // an explicit /web/ route here would conflict with the nest_service.
-        return router.nest_service("/web", ServeDir::new(dir).fallback(ServeFile::new(index)));
+        let injected = inject_base_href(
+            &std::fs::read_to_string(dir.join("index.html")).unwrap_or_default(),
+            base_href,
+        );
+        info!(mount, base_href, "custom web UI mounted");
+        // Assets are served as files; any unmatched path (SPA client route)
+        // falls back to the injected index. `append_index_html_on_directories`
+        // is off so the directory index also flows through the injecting
+        // fallback rather than serving the raw on-disk index.html.
+        let spa = ServeDir::new(dir)
+            .append_index_html_on_directories(false)
+            .fallback(axum::routing::get(move || {
+                let body = injected.clone();
+                async move { axum::response::Html(body) }
+            }));
+        return if slug.is_empty() {
+            router.fallback_service(spa)
+        } else {
+            router.nest_service(&slug, spa)
+        };
     }
 
     let web_router = ai_memory_web::router(reader, wiki);
-    info!("read-only wiki browser mounted at /web");
-    router
-        .route(
-            "/web/",
-            axum::routing::get(|| async { axum::response::Redirect::permanent("/web") }),
-        )
-        .nest("/web", web_router)
+    info!(mount, "read-only wiki browser mounted");
+    if slug.is_empty() {
+        router.merge(web_router)
+    } else {
+        let redirect_to = slug.clone();
+        router
+            .route(
+                &format!("{slug}/"),
+                axum::routing::get(move || {
+                    let to = redirect_to.clone();
+                    async move { axum::response::Redirect::permanent(&to) }
+                }),
+            )
+            .nest(&slug, web_router)
+    }
 }
 
 fn apply_http_layers(
@@ -913,6 +1080,8 @@ mod tests {
             wiki,
             None,
             &[],
+            "/web",
+            "/web/",
         );
         let router = apply_http_layers(
             router,
@@ -1074,6 +1243,8 @@ mod tests {
             wiki,
             None,
             &cors_origins,
+            "/web",
+            "/web/",
         );
         // No auth layer so we can reach /api/v1 directly.
         let resp = router
@@ -1123,6 +1294,8 @@ mod tests {
             wiki,
             None,
             &cors_origins,
+            "/web",
+            "/web/",
         );
         let resp = router
             .oneshot(
@@ -1161,6 +1334,8 @@ mod tests {
             wiki,
             None,
             &cors_origins,
+            "/web",
+            "/web/",
         );
         // /web is a non-api route; sending an Origin header must not trigger CORS.
         let resp = router
