@@ -4,7 +4,7 @@
 //! - `POST /admin/backup`         — snapshot db + wiki into a gzip tarball (binary response).
 //! - `POST /admin/bootstrap`      — ingest a pre-collected source bundle
 //!   into seed wiki pages via the configured LLM provider.
-//! - `POST /admin/auto-improve`   — review one session and stage proposals.
+//! - `POST /admin/auto-improve`   — review one session and apply or stage proposals.
 //! - `POST /admin/curator`        — dry-run or stage a rule-based curator report.
 //! - `GET  /admin/status`         — lifetime counts + server data-dir info.
 //! - `GET  /admin/search?q=`      — FTS5 hits against the wiki index.

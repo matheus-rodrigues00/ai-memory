@@ -1,10 +1,12 @@
 # Optional Auto-Improvement Loop Research
 
-> Status: research plus implemented production notes. CLI/admin/MCP
-> auto-improvement records validated proposals in the pending-writes audit trail
-> and auto-approves them through the normal wiki write path by default. Admins
-> can set `[auto_improve] require_approval = true` for manual review.
-> Session-end triggers remain future work.
+> Status: research plus implemented production notes. The server schedules
+> auto-improvement for newly completed sessions when an LLM provider is
+> configured. Manual CLI/admin/MCP auto-improvement remains available for
+> targeted runs and catch-up. Both paths record validated proposals in the
+> pending-writes audit trail and auto-approve them through the normal wiki write
+> path by default. Admins can set `[auto_improve] require_approval = true` for
+> manual review.
 
 ## Executive Summary
 
@@ -19,7 +21,8 @@ or silently promoting weak session residue into rules.
 The safe product shape is:
 
 1. Keep automatic observation capture and session consolidation as they are.
-2. Add an optional background review pass that creates pending wiki edits.
+2. Add a background review pass that creates pending wiki edits for newly
+   completed sessions when an LLM provider is configured.
 3. Record proposals and apply them through the approval/audit path by default,
    with manual approval available as an admin opt-in.
 4. Keep a separate slow maintenance pass for deduplication, stale-page review,
@@ -156,24 +159,28 @@ new memory substrate.
 
 ## Recommendation
 
-Build auto-improvement as a default-available review path that records proposal
-provenance before writing target wiki pages. Manual CLI/admin/MCP runs apply
-validated proposals through the same approval path used by pending-writes;
-manual approval remains an admin opt-in.
+Build auto-improvement as a default-available scheduled review path that records
+proposal provenance before writing target wiki pages. Manual CLI/admin/MCP runs
+use the same pipeline for targeted review or historical catch-up. Scheduling and
+approval are separate: the scheduler decides when to review newly completed
+sessions, and the approval policy decides whether validated proposals are applied
+immediately or left pending for humans.
 
 The shipped feature is an audit-first learning reviewer:
 
-1. CLI/admin/MCP auto-improvement is enabled when an LLM provider is configured.
-   Manual runs do not enable any session-end trigger.
+1. Scheduled auto-improvement is enabled when an LLM provider is configured and
+   `[auto_improve.scheduler] enabled = true`. Manual runs do not affect the
+   scheduler.
 2. Reads a completed session, recent pages, and relevant existing wiki pages.
 3. Produces a structured proposal containing small page creates or updates.
 4. Stores the proposal in a pending-review queue with evidence and diffs.
 5. Applies approved proposals through `Wiki::apply_batch`, admission webhooks,
    auth capabilities, audit logging, and the single writer actor.
 
-Auto-apply can be considered later for narrow, high-confidence updates, but the
-current version earns trust by recording staged proposals and applying them
-through the same approval path, while allowing admins to require manual review.
+Auto-approval is the default, but it still records staged proposals and applies
+them through the same approval path. Admins who want a human queue set
+`[auto_improve] require_approval = true`; admins who want no automatic review set
+`[auto_improve.scheduler] enabled = false`.
 
 ## Proposed Page Targets
 
@@ -210,27 +217,31 @@ The review prompt should explicitly reject these as durable learning:
 
 Any implementation should preserve these invariants:
 
-1. Manual CLI/admin/MCP runs record proposals and auto-approve by default.
-2. Automatic SessionEnd triggering is off by default.
-3. Never mutate the active session prompt or already-prepended handoff context.
-4. Never run inside hook latency. Hooks remain fire-and-forget and bounded.
-5. Never bypass workspace/project isolation. Use `ScopeResolver` or its explicit
+1. Scheduled and manual CLI/admin/MCP runs record proposals and auto-approve by
+   default.
+2. Scheduling and approval remain separate: disabling the scheduler does not
+   require manual approvals, and requiring approvals does not stop scheduling.
+3. Automatic SessionEnd triggering is off by default.
+4. Never mutate the active session prompt or already-prepended handoff context.
+5. Never run inside hook latency. Hooks remain fire-and-forget and bounded.
+6. Never bypass workspace/project isolation. Use `ScopeResolver` or its explicit
    helpers for every read and write path.
-6. Never bypass auth. Use `AuthLevel::authorize(Capability::...)` for all admin
+7. Never bypass auth. Use `AuthLevel::authorize(Capability::...)` for all admin
    and write surfaces.
-7. Never write wiki files directly from a handler or background worker. Use
+8. Never write wiki files directly from a handler or background worker. Use
    `Wiki::write_page`, `Wiki::apply_batch`, or existing destructive helpers.
-8. Never auto-delete semantic pages. Use supersession, pending proposals, or the
+9. Never auto-delete semantic pages. Use supersession, pending proposals, or the
    existing retention sweep for episodic pages.
-9. Never rewrite pinned pages or invariant slots unless the proposal cites a
+10. Never rewrite pinned pages or invariant slots unless the proposal cites a
    direct contradiction and is explicitly approved.
-10. Include source evidence for every proposed edit.
-11. Attribute autonomous proposals to a distinct `auto_improve` actor so audit
+11. Include source evidence for every proposed edit.
+12. Attribute autonomous proposals to a distinct `auto_improve` actor so audit
     logs, admission webhooks, and review screens can distinguish machine-suggested
     changes from user/root writes.
-12. Bound model cost, input size, output size, and number of proposed page
+13. Bound model cost, input size, output size, and number of proposed page
     mutations per run.
-13. Write a human-readable and machine-readable report for each run.
+14. Write a machine-readable audit row for every run and human-readable proposal
+    sidecars whenever proposals exist.
 
 ## Existing User Upgrade Contract
 
@@ -239,15 +250,20 @@ Default-available auto-improvement must not surprise existing installs:
 1. Existing project wiki folders need no migration. Older configs may still
    contain an `[auto_improve] mode = ...` key; current ai-memory ignores that
    legacy key. Operators can remove the line when convenient.
-2. Session-end triggering stays off until a bounded background scheduler exists;
-   hooks must not gain LLM latency as a side effect of upgrade.
-3. Pending proposal storage must use additive, idempotent migrations that
-   preserve all existing wiki files and session/observation rows.
-4. Existing installed `CLAUDE.md`/`AGENTS.md` blocks remain valid. Operators pick
+2. Session-end triggering stays off; the bounded background scheduler runs
+   outside hook latency and sleeps for its configured interval between ticks.
+3. The scheduler initializes a first-run watermark per workspace/project and
+   records a per-session claim before scheduled LLM work. Historical sessions are
+   not reviewed automatically on upgrade, and failed scheduled reviews are not
+   retried forever. Manual auto-improve remains the catch-up path for old or
+   failed scheduled sessions.
+4. Pending proposal storage must use additive, idempotent migrations that
+    preserve all existing wiki files and session/observation rows.
+5. Existing installed `CLAUDE.md`/`AGENTS.md` blocks remain valid. Operators pick
    up newer proactive retrieval guidance by running `ai-memory install-instructions`
    or asking an agent to refresh the ai-memory routing block. The marker-based
    replacement must remain idempotent.
-5. Target-page mutations must pass through proposal staging first and must keep
+6. Target-page mutations must pass through proposal staging first and must keep
    approval attribution separate from the autonomous
    `auto_improve` proposal actor.
 
@@ -260,23 +276,24 @@ The exact names can change, but the shape should be explicit and conservative:
 require_approval = false      # true leaves proposals pending for manual review
 min_observations = 8
 min_session_duration_secs = 120
-min_confidence = 0.75         # tune before any future unattended trigger design
+min_confidence = 0.75
 max_input_tokens = 24000
 max_proposals_per_run = 5
 include_raw_fallback = false
 proposal_actor = "auto_improve"
 pending_path = "_pending/auto-improve"
+
+[auto_improve.scheduler]
+enabled = true                # false disables background review only
+interval_secs = 3600          # 0 disables background review only
+max_sessions_per_tick = 1
+min_session_age_secs = 600
 ```
 
-Future scheduled maintenance settings should live in a separate config section
-once that scheduler exists; do not copy unsupported `auto_improve.maintenance`
-keys into current configs.
-
-A future unattended session-end loop must not ship until manually-triggered
-auto-improvement has enough real usage to calibrate prompt quality and
-false-positive rates. The confidence threshold should remain configurable
-because real projects vary; initial values should be chosen from applied
-proposals against existing deployed wikis, not from prompt intuition alone.
+`[auto_improve.scheduler]` controls whether and how often the server launches
+background review. `[auto_improve] require_approval` controls whether validated
+proposals are applied automatically or left pending. They intentionally do not
+imply each other.
 
 ## Proposal Format
 
@@ -314,15 +331,16 @@ or confidence below the configured threshold.
 
 ## Pending Review UX
 
-The first production UX is explicit and audit-gated. CLI/admin/MCP
-auto-improvement records validated pending proposals, then auto-approves them by
-default through the wiki mutation path. With `require_approval = true`,
+The first production UX is explicit and audit-gated. The scheduler and
+CLI/admin/MCP manual runs record validated pending proposals, then auto-approve
+them by default through the wiki mutation path. With `require_approval = true`,
 `pending-writes` applies or rejects them later.
 
 | Command or route | Purpose |
 |---|---|
-| `ai-memory auto-improve --session-id <id>` | Review one session and apply validated proposals through the auto-improvement approval path. |
-| `memory_auto_improve` | Review the latest completed session or a named session and apply validated proposals through the same path. |
+| Background scheduler | Reviews newly completed sessions after the first-run watermark and applies or stages validated proposals according to approval policy. |
+| `ai-memory auto-improve --session-id <id>` | Manually review one session and apply or stage validated proposals through the auto-improvement approval path. |
+| `memory_auto_improve` | Manually review the latest completed session or a named session and apply or stage validated proposals through the same path. |
 | `ai-memory curator` | Rule-based, report-only maintenance review. |
 | `ai-memory curator --stage` | Stage exactly one curator report page for pending-writes approval. |
 | `ai-memory pending-writes list` | Show staged wiki changes. |
@@ -419,17 +437,23 @@ Tests:
 7. Approval/audit metadata preserves `auto_improve` proposal attribution and the
    approving actor separately.
 
-### Phase 3: Optional Session-End Trigger
+### Phase 3: Background Scheduler
 
-Add a background trigger behind config. It should run after the normal session
-page is written and never block the hook response.
+Status: implemented as a server-side scheduler, not a SessionEnd hook trigger.
+The scheduler is enabled by default when an LLM provider exists, sleeps for its
+configured interval, and reviews only newly completed sessions after the
+persisted first-run watermark. It records a per-session claim before calling the
+LLM, so scheduled review is at-most-once per completed session unless an admin
+reruns auto-improve manually.
 
 Tests:
 
-1. Disabled config does nothing.
-2. Enabled config stages proposals after session-end.
-3. Saturated or failed review leaves normal session-end behavior intact.
-4. Reports include model/provider, scope, proposals, rejections, and errors.
+1. Disabled scheduler config does nothing while manual runs still work.
+2. Enabled scheduler reviews only post-watermark sessions.
+3. Saturated or failed review leaves normal session-end behavior intact and does
+   not retry the same session forever.
+4. Run rows include model/provider, scope, proposals, rejections, config, and
+   scheduler trigger metadata.
 
 ### Phase 4: Maintenance Curator
 
@@ -454,10 +478,6 @@ Tests:
 4. The minimum confidence threshold should be configurable and calibrated with
    applied proposals on real projects before any future unattended trigger is considered.
 
-## Remaining Open Question
-
-Should unattended SessionEnd auto-improvement ever be enabled by default?
-
 ## Current Conclusion
 
 Hermes validates the idea, but also shows why the boundaries matter. The useful
@@ -465,7 +485,8 @@ part is not that the agent can write memory by itself. The useful part is a
 bounded, observable, reviewable loop that turns repeated work into durable
 knowledge while keeping active task execution isolated.
 
-For ai-memory, the current correct boundary is pending proposal storage under
-`_pending/auto-improve/` plus approval/rejection commands. Unattended
-SessionEnd mutation should remain out of scope until manually-triggered applied
-proposals prove high signal in real deployments.
+For ai-memory, the current correct boundary is scheduled review plus pending
+proposal storage under `_pending/auto-improve/`. Approval policy is separate:
+default auto-approval keeps the wiki compiling forward, while
+`require_approval = true` gives admins a human queue without disabling the
+learning loop.

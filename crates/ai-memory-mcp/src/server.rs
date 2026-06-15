@@ -92,11 +92,13 @@ the conversation calls for them:\n\
   observations into wiki pages. Also runs on PreCompact, and at \
   session end only when AI_MEMORY_CONSOLIDATE_ON_SESSION_END is set.\n\
 - `memory_auto_improve` — when the user asks what durable lessons \
-  should be proposed from a completed session, or at explicit wrap-up \
-  when learning review is useful. It reads the latest completed session \
-  by default and applies validated edits through the auto-improvement \
-  approval path. Admins can set `[auto_improve] require_approval = true` \
-  to leave proposals in pending-writes for manual review.\n\
+should be proposed from a completed session, or at explicit wrap-up \
+  when learning review is useful. It is the manual version of the server's \
+  scheduled auto-improvement loop, reads the latest completed session by \
+  default, and applies or stages validated edits through the auto-improvement \
+  approval path. Admins can set `[auto_improve.scheduler] enabled = false` \
+  to stop scheduling, or `[auto_improve] require_approval = true` to leave \
+  scheduled and manual proposals in pending-writes for review.\n\
 - `memory_write_page` — when the user explicitly asks to remember, \
   save, or annotate durable project knowledge. This writes a wiki page; \
   do NOT use `memory_handoff_begin` for permanent annotations. \
@@ -1163,7 +1165,7 @@ impl AiMemoryServer {
 
     /// Stage durable wiki edit proposals for a completed session.
     #[tool(
-        description = "Run auto-improvement for one completed session and apply validated wiki edit proposals through the auto-improvement approval path. Use when the user asks what durable lessons should be captured, what memory pages this session suggests, or at explicit wrap-up when a learning review is useful. Omit `session_id` to review the latest completed session in the current project. Admins can set `[auto_improve] require_approval = true` to leave proposals pending for manual review."
+        description = "Run manual auto-improvement for one completed session and apply or stage validated wiki edit proposals through the auto-improvement approval path. Use when the user asks what durable lessons should be captured, what memory pages this session suggests, or at explicit wrap-up when a learning review is useful. Omit `session_id` to review the latest completed session in the current project. The server also schedules background review for newly completed sessions when an LLM provider is configured. Admins can set `[auto_improve.scheduler] enabled = false` to stop automatic review, or `[auto_improve] require_approval = true` to leave scheduled and manual proposals pending for review."
     )]
     async fn memory_auto_improve(
         &self,
@@ -2418,7 +2420,8 @@ mod tests {
             let lower = prompt.to_ascii_lowercase();
             assert!(prompt.contains("memory_auto_improve"));
             assert!(
-                lower.contains("applies validated") || lower.contains("approval path"),
+                lower.contains("applies validated")
+                    || (lower.contains("approval") && lower.contains("path")),
                 "prompt must state auto-improve applies through the approval path"
             );
             assert!(
@@ -2437,7 +2440,7 @@ mod tests {
             .description
             .as_deref()
             .expect("memory_auto_improve must carry a description");
-        assert!(desc.contains("apply validated"));
+        assert!(desc.contains("apply or stage validated"));
         assert!(desc.contains("approval"));
     }
 

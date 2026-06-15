@@ -1,6 +1,6 @@
 <svg xmlns="http://www.w3.org/2000/svg" width="1400" height="920" viewBox="0 0 1400 920" role="img" aria-labelledby="title desc">
   <title id="title">ai-memory architecture overview</title>
-  <desc id="desc">A diagram showing agent clients sending lifecycle hooks and MCP calls into ai-memory serve, which routes through hook, MCP, web, admin, scope, auth, writer, read pool, markdown wiki, SQLite index, maintenance jobs, and optional LLM and embedding providers.</desc>
+  <desc id="desc">A diagram showing agent clients sending lifecycle hooks and MCP calls into ai-memory serve, which routes through hook, MCP, web, admin, scope, auth, writer, read pool, markdown wiki, SQLite index, scheduled auto-improvement and maintenance jobs, and optional LLM and embedding providers.</desc>
   <defs>
     <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse">
       <path d="M 0 0 L 10 5 L 0 10 z" fill="#334155" />
@@ -61,7 +61,7 @@
   <rect class="external" x="1050" y="130" width="290" height="118" />
   <text class="box-title" x="1075" y="164">Optional providers</text>
   <text class="box-text" x="1075" y="190">LLM consolidation and lint</text>
-  <text class="box-text" x="1075" y="211">auto-improvement review/approval</text>
+  <text class="box-text" x="1075" y="211">scheduled review + approval</text>
   <text class="box-text" x="1075" y="232">embedding vector backfill</text>
 
   <rect class="server" x="60" y="300" width="1280" height="390" />
@@ -98,10 +98,10 @@
   <text class="box-text" x="580" y="615">optional vector RRF + raw fallback</text>
 
   <rect class="job" x="960" y="535" width="300" height="110" />
-  <text class="box-title" x="985" y="568">Lifecycle and maintenance jobs</text>
+  <text class="box-title" x="985" y="568">Lifecycle and scheduled jobs</text>
   <text class="box-text" x="985" y="594">session summary + handoff</text>
-  <text class="box-text" x="985" y="615">consolidate, auto-improve</text>
-  <text class="box-text" x="985" y="636">lint, embed, sweep</text>
+  <text class="box-text" x="985" y="615">auto-improve scheduler</text>
+  <text class="box-text" x="985" y="636">consolidate, lint, embed, sweep</text>
 
   <text class="group-label" x="70" y="735">DURABLE STATE</text>
   <rect class="store" x="105" y="755" width="350" height="120" />

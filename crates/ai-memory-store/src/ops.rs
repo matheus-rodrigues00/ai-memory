@@ -1157,6 +1157,10 @@ pub struct MoveSummary {
     pub auto_improve_runs_moved: u64,
     /// `auto_improve_proposals` rows re-stamped.
     pub auto_improve_proposals_moved: u64,
+    /// `auto_improve_scheduler_state` rows re-stamped.
+    pub auto_improve_scheduler_state_moved: u64,
+    /// `auto_improve_scheduler_claims` rows re-stamped.
+    pub auto_improve_scheduler_claims_moved: u64,
 }
 
 /// Re-stamp a project's `workspace_id` across every domain table in ONE
@@ -1218,6 +1222,14 @@ pub fn move_project_workspace(
         "UPDATE auto_improve_proposals SET workspace_id = ?1 WHERE project_id = ?2 AND workspace_id = ?3",
         params![&to[..], &pid[..], &from[..]],
     )? as u64;
+    let auto_improve_scheduler_state_moved = tx.execute(
+        "UPDATE auto_improve_scheduler_state SET workspace_id = ?1 WHERE project_id = ?2 AND workspace_id = ?3",
+        params![&to[..], &pid[..], &from[..]],
+    )? as u64;
+    let auto_improve_scheduler_claims_moved = tx.execute(
+        "UPDATE auto_improve_scheduler_claims SET workspace_id = ?1 WHERE project_id = ?2 AND workspace_id = ?3",
+        params![&to[..], &pid[..], &from[..]],
+    )? as u64;
 
     let projects_updated = tx.execute(
         "UPDATE projects SET workspace_id = ?1 WHERE id = ?2 AND workspace_id = ?3",
@@ -1238,6 +1250,8 @@ pub fn move_project_workspace(
         audit_log_moved,
         auto_improve_runs_moved,
         auto_improve_proposals_moved,
+        auto_improve_scheduler_state_moved,
+        auto_improve_scheduler_claims_moved,
     })
 }
 

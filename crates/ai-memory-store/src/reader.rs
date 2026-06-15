@@ -14,6 +14,7 @@ use ai_memory_core::{
     AgentKind, AutoImproveProposalId, Handoff, HandoffId, HandoffState, Observation, ObservationId,
     ObservationKind, PageId, PagePath, ProjectId, SessionId, User, UserId, WorkspaceId,
 };
+use jiff::Timestamp;
 use parking_lot::Mutex;
 use rusqlite::types::Value;
 use rusqlite::{Connection, OpenFlags, OptionalExtension, params, params_from_iter};
@@ -43,6 +44,15 @@ pub struct PageHit {
     pub snippet: String,
     /// FTS5 rank score (lower is better — closer to query terms).
     pub rank: f64,
+}
+
+/// Completed session selected for scheduled auto-improvement.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AutoImproveCandidateSession {
+    /// Session id.
+    pub session_id: SessionId,
+    /// Session `ended_at` timestamp in Unix microseconds.
+    pub ended_at: i64,
 }
 
 /// The latest version of a page's stored content, used as a DB-backed
@@ -947,6 +957,89 @@ impl ReaderPool {
             row_opt
                 .map(|bytes| SessionId::from_slice(&bytes).map_err(StoreError::from))
                 .transpose()
+        })
+        .await
+    }
+
+    /// Return completed sessions eligible for scheduled auto-improvement.
+    ///
+    /// The scheduler uses a persisted first-run watermark so an upgrade with an
+    /// LLM provider configured does not chew through historical backlog by
+    /// default. The scheduler inserts a per-session claim before the LLM call,
+    /// so failed scheduled reviews do not retry forever or starve newer
+    /// sessions. Any existing auto-improvement run row for a session also counts
+    /// as a scheduler review for candidate selection; manual reruns remain
+    /// available through CLI/admin/MCP.
+    ///
+    /// # Errors
+    /// Propagates any SQL or pool error.
+    pub async fn auto_improve_candidate_sessions(
+        &self,
+        workspace_id: WorkspaceId,
+        project_id: ProjectId,
+        min_session_age_secs: u64,
+        limit: usize,
+    ) -> StoreResult<Vec<AutoImproveCandidateSession>> {
+        let cutoff = Timestamp::now().as_microsecond().saturating_sub(
+            (min_session_age_secs.min(i64::MAX as u64 / 1_000_000) as i64) * 1_000_000,
+        );
+        self.with_conn(move |conn| {
+            let watermark: Option<i64> = conn
+                .query_row(
+                    "SELECT watermark_ended_at FROM auto_improve_scheduler_state \
+                     WHERE workspace_id = ?1 AND project_id = ?2",
+                    params![workspace_id.as_bytes(), project_id.as_bytes()],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            let Some(watermark) = watermark else {
+                return Ok(Vec::new());
+            };
+
+            let mut stmt = conn.prepare_cached(
+                "SELECT s.id, s.ended_at FROM sessions s \
+                 WHERE s.workspace_id = ?1 \
+                   AND s.project_id = ?2 \
+                   AND s.ended_at IS NOT NULL \
+                   AND s.ended_at > ?3 \
+                   AND s.ended_at <= ?4 \
+                   AND NOT EXISTS ( \
+                       SELECT 1 FROM auto_improve_scheduler_claims c \
+                       WHERE c.workspace_id = s.workspace_id \
+                         AND c.project_id = s.project_id \
+                         AND c.session_id = s.id \
+                   ) \
+                   AND NOT EXISTS ( \
+                       SELECT 1 FROM auto_improve_runs r \
+                       WHERE r.workspace_id = s.workspace_id \
+                         AND r.project_id = s.project_id \
+                         AND r.session_id = s.id \
+                   ) \
+                 ORDER BY s.ended_at ASC, s.started_at ASC \
+                 LIMIT ?5",
+            )?;
+            let rows = stmt.query_map(
+                params![
+                    workspace_id.as_bytes(),
+                    project_id.as_bytes(),
+                    watermark,
+                    cutoff,
+                    limit.min(i64::MAX as usize) as i64,
+                ],
+                |row| {
+                    let id_bytes: Vec<u8> = row.get(0)?;
+                    Ok((id_bytes, row.get::<_, i64>(1)?))
+                },
+            )?;
+            let mut out = Vec::new();
+            for row in rows {
+                let (id_bytes, ended_at) = row?;
+                out.push(AutoImproveCandidateSession {
+                    session_id: SessionId::from_slice(&id_bytes)?,
+                    ended_at,
+                });
+            }
+            Ok(out)
         })
         .await
     }

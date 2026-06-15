@@ -28,11 +28,13 @@ Solid arrows are request, read, and write paths. Dashed arrows are
 background reconciliation or provider-backed maintenance. The core invariant is
 unchanged: the markdown wiki is the source of truth, and SQLite is the derived
 index for search, sessions, observations, handoffs, audit, and embeddings.
-Auto-improvement sits on the provider-backed maintenance side: it reviews a
-completed session, records validated proposals in the pending-writes audit trail,
-and auto-approves them through the normal wiki write path by default. Admins can
-set `[auto_improve] require_approval = true` to leave proposals pending for
-manual review.
+Auto-improvement sits on the provider-backed maintenance side: the server
+schedules reviews for newly completed sessions, records validated proposals in
+the pending-writes audit trail, and auto-approves them through the normal wiki
+write path by default. Scheduling and approval are separate. Admins can set
+`[auto_improve.scheduler] enabled = false` to stop background review, or
+`[auto_improve] require_approval = true` to leave scheduled and manual proposals
+pending for review.
 
 **Steady-state loop:**
 
@@ -56,12 +58,16 @@ manual review.
 4. When `AI_MEMORY_LLM_PROVIDER` is set, `memory_consolidate` rewrites
    that summary into a richer durable page or fans out into a
    multi-page batch under `concepts/`, `decisions/`, `gotchas/`.
-5. On explicit CLI/admin/MCP request, auto-improvement reviews one completed
-   session with the configured LLM, records validated `concepts/`, `decisions/`,
-   `gotchas/`, `procedures/`, and `_rules/` proposals in the pending-writes
-   audit trail, then approves them through the wiki mutation path by default.
-   Auto-improvement does not run on SessionEnd by default. With
-   `[auto_improve] require_approval = true`, proposals remain pending until an
+5. When an LLM provider is configured, the auto-improvement scheduler reviews
+   newly completed sessions outside hook latency. It records validated
+   `concepts/`, `decisions/`, `gotchas/`, `procedures/`, and `_rules/` proposals
+   in the pending-writes audit trail, then approves them through the wiki
+   mutation path by default. The scheduler initializes a per-project first-run
+   watermark so historical sessions are not processed automatically on upgrade,
+   then records per-session claims before LLM work so failed scheduled reviews do
+   not retry forever. Explicit CLI/admin/MCP auto-improve calls use the same
+   pipeline for targeted reruns or catch-up. With `[auto_improve]
+   require_approval = true`, scheduled and manual proposals remain pending until
    explicit pending-writes approval.
 6. `memory_query` answers via FTS5 + link-neighbour RRF; when an
    embedder is configured, vector cosine over `page_embeddings` joins
@@ -214,7 +220,7 @@ invariants below.
 | `memory_handoff_accept` | destructive | Fetch + ack the latest open handoff (auto-cwd-matched by default). Optional `workspace` + `project` targets a named sibling workspace/project. |
 | `memory_handoff_cancel` | destructive | Mark an exact open handoff id expired when it was created by mistake. |
 | `memory_consolidate` | destructive | LLM-driven page rewrite. `multi_page=true` for atomic fan-out. |
-| `memory_auto_improve` | write | Review a completed session and apply validated wiki edits through the auto-improvement approval path. Defaults to the latest completed session in the resolved current project; `[auto_improve] require_approval = true` leaves proposals pending for manual review. |
+| `memory_auto_improve` | write | Manually review a completed session and apply or stage validated wiki edits through the auto-improvement approval path. Defaults to the latest completed session in the resolved current project; the server also schedules review for new sessions; `[auto_improve] require_approval = true` leaves proposals pending for manual review. |
 | `memory_write_page` | destructive | Write durable wiki knowledge when the user explicitly asks to remember/annotate something permanent. |
 | `memory_delete_page` | destructive | Delete a single page by exact `path`. Fires the admission chain (op=delete); idempotent. |
 | `memory_forget_sweep` | destructive | M8 retention pass. `dry_run=true` for preview. |
@@ -330,6 +336,12 @@ max_proposals_per_run = 5
 include_raw_fallback = false
 proposal_actor = "auto_improve"
 pending_path = "_pending/auto-improve"
+
+[auto_improve.scheduler]           # background review; separate from approval
+enabled = true
+interval_secs = 3600
+max_sessions_per_tick = 1
+min_session_age_secs = 600
 ```
 
 **LLM provider env** (opt-in):
@@ -371,9 +383,9 @@ LLM_API_KEY                    accepted for openai embeddings only with a custom
   thousand pages; past that, the `sqlite-vec` extension is the next
   step. See [`docs/vector-backend-policy.md`](vector-backend-policy.md)
   for the criteria that should justify adding it.
-* **Scheduled consolidation queue.** Forget sweep and lint already run
-  on the server's maintenance schedule; a future queue can compile
-  session summaries outside hook latency.
+* **Scheduled consolidation queue.** Forget sweep, lint, and auto-improvement
+  already run on server-side schedules; a future queue can compile session
+  summaries outside hook latency.
 * **Richer curator actions.** The shipped curator stages only one report page;
   future work can add individual merge/supersession/link-fix proposals while
   keeping deletes and semantic rewrites review-gated.

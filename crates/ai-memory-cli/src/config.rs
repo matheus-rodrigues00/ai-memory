@@ -105,9 +105,10 @@ pub struct Config {
     pub decay: ai_memory_store::DecayParams,
     /// Server-side scheduled maintenance. Jobs run outside hook latency.
     pub maintenance: MaintenanceSettings,
-    /// Optional auto-improvement reviewer. Manual CLI/admin runs approve
-    /// validated proposals by default unless `require_approval` is set; the
-    /// SessionEnd trigger stays off by default.
+    /// Auto-improvement reviewer. The scheduler launches background review for
+    /// newly completed sessions; manual CLI/admin/MCP runs remain available.
+    /// Both approve validated proposals by default unless `require_approval` is
+    /// set. The SessionEnd trigger stays off by default.
     pub auto_improve: AutoImproveSettings,
     /// Privacy-strip tuning. Built-in patterns always run; this section
     /// lets the operator extend or punch holes in them.
@@ -366,6 +367,9 @@ impl Default for Config {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct AutoImproveSettings {
+    /// Background scheduler settings. This controls whether reviews are launched
+    /// automatically; it does not control whether accepted proposals are applied.
+    pub scheduler: AutoImproveSchedulerSettings,
     /// Require manual pending-writes approval. Defaults false so validated
     /// proposals are staged for audit and immediately approved through the
     /// normal wiki write path.
@@ -391,9 +395,35 @@ pub struct AutoImproveSettings {
     pub pending_path: String,
 }
 
+/// `[auto_improve.scheduler]` background learning loop settings.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct AutoImproveSchedulerSettings {
+    /// Whether the server should periodically review newly-completed sessions.
+    pub enabled: bool,
+    /// Scheduler cadence. `0` disables the scheduler while keeping manual runs.
+    pub interval_secs: u64,
+    /// Maximum sessions reviewed per scheduler tick. `0` disables the scheduler.
+    pub max_sessions_per_tick: usize,
+    /// Minimum age after SessionEnd before a session becomes eligible.
+    pub min_session_age_secs: u64,
+}
+
+impl Default for AutoImproveSchedulerSettings {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            interval_secs: 3_600,
+            max_sessions_per_tick: 1,
+            min_session_age_secs: 600,
+        }
+    }
+}
+
 impl Default for AutoImproveSettings {
     fn default() -> Self {
         Self {
+            scheduler: AutoImproveSchedulerSettings::default(),
             require_approval: false,
             on_session_end: false,
             min_observations: ai_memory_consolidate::DEFAULT_AUTO_IMPROVE_MIN_OBSERVATIONS,
@@ -791,6 +821,10 @@ mod tests {
         assert_eq!(cfg.maintenance.forget_sweep_interval_secs, 86_400);
         assert_eq!(cfg.maintenance.lint_interval_secs, 86_400);
         assert_eq!(cfg.maintenance.embedding_backfill_interval_secs, 0);
+        assert!(cfg.auto_improve.scheduler.enabled);
+        assert_eq!(cfg.auto_improve.scheduler.interval_secs, 3_600);
+        assert_eq!(cfg.auto_improve.scheduler.max_sessions_per_tick, 1);
+        assert_eq!(cfg.auto_improve.scheduler.min_session_age_secs, 600);
         assert!(!cfg.auto_improve.on_session_end);
         assert!(!cfg.auto_improve.require_approval);
         assert_eq!(cfg.auto_improve.min_observations, 8);
@@ -849,6 +883,12 @@ mod tests {
             include_raw_fallback = true
             proposal_actor = "review_bot"
             pending_path = "_pending/review-bot"
+
+            [auto_improve.scheduler]
+            enabled = true
+            interval_secs = 1800
+            max_sessions_per_tick = 4
+            min_session_age_secs = 30
             "#,
         )
         .unwrap();
@@ -860,6 +900,10 @@ mod tests {
         assert_eq!(cfg.log_level, "debug");
         assert!(!cfg.maintenance.enabled);
         assert_eq!(cfg.maintenance.lint_interval_secs, 3600);
+        assert!(cfg.auto_improve.scheduler.enabled);
+        assert_eq!(cfg.auto_improve.scheduler.interval_secs, 1_800);
+        assert_eq!(cfg.auto_improve.scheduler.max_sessions_per_tick, 4);
+        assert_eq!(cfg.auto_improve.scheduler.min_session_age_secs, 30);
         assert!(cfg.auto_improve.on_session_end);
         assert!(cfg.auto_improve.require_approval);
         assert_eq!(cfg.auto_improve.min_observations, 3);

@@ -5,14 +5,21 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
-use ai_memory_consolidate::{Consolidator, run_lint, run_sweep};
-use ai_memory_core::{ActiveProject, ProjectId, Sanitizer, WorkspaceId};
+use ai_memory_consolidate::{
+    AutoImproveReviewConfig, Consolidator, run_auto_improve_review, run_lint, run_sweep,
+};
+use ai_memory_core::{
+    ActiveProject, ActorContext, PagePath, ProjectId, Sanitizer, SessionId, WorkspaceId,
+};
 use ai_memory_hooks::{
     DEFAULT_HOOK_INGEST_MAX_IN_FLIGHT, HookState, ProjectCacheStore, hook_router,
 };
 use ai_memory_llm::{Embedder, LlmProvider, ProviderHealth, build_embedder, build_provider};
 use ai_memory_mcp::{AdminState, AiMemoryServer, admin_router};
-use ai_memory_store::{EmbeddingWrite, ReaderPool, Store, WriterHandle, f32_vec_to_bytes};
+use ai_memory_store::{
+    ApproveAutoImproveProposalResult, AutoImproveProposalOperation, EmbeddingWrite,
+    NewAutoImproveProposal, ReaderPool, StageAutoImproveRun, Store, WriterHandle, f32_vec_to_bytes,
+};
 use ai_memory_web;
 use ai_memory_wiki::{WatcherHandle, Wiki, migrations, run_wiki_migrations};
 use anyhow::{Context, Result};
@@ -34,7 +41,7 @@ use tracing::info;
 
 use crate::auth::{AuthState, require_bearer};
 use crate::cli::{ServeArgs, TransportKind};
-use crate::config::{Config, MaintenanceSettings};
+use crate::config::{AutoImproveSettings, Config, MaintenanceSettings};
 
 /// 10 MB cap on inbound HTTP bodies. The /hook ingress accepts the
 /// agent's raw payload which can include a tool output excerpt
@@ -177,6 +184,7 @@ pub async fn run(config: &Config, args: ServeArgs) -> Result<()> {
     let admin_llm = consolidator_setup.admin_llm;
     let _maintenance_tasks = start_maintenance_scheduler(
         config.maintenance.clone(),
+        config.auto_improve.clone(),
         store.reader.clone(),
         store.writer.clone(),
         wiki.clone(),
@@ -425,6 +433,7 @@ pub async fn run(config: &Config, args: ServeArgs) -> Result<()> {
 #[allow(clippy::too_many_arguments)]
 fn start_maintenance_scheduler(
     settings: MaintenanceSettings,
+    auto_improve: AutoImproveSettings,
     reader: ReaderPool,
     writer: WriterHandle,
     wiki: Wiki,
@@ -434,9 +443,9 @@ fn start_maintenance_scheduler(
     project_id: ProjectId,
     decay: ai_memory_store::DecayParams,
 ) -> Vec<tokio::task::JoinHandle<()>> {
-    if !settings.enabled {
-        info!("scheduled maintenance disabled");
-        return Vec::new();
+    let maintenance_enabled = settings.enabled;
+    if !maintenance_enabled {
+        info!("scheduled retention/lint/embed maintenance disabled");
     }
 
     let forget_sweep_interval_secs = settings.forget_sweep_interval_secs;
@@ -444,7 +453,7 @@ fn start_maintenance_scheduler(
     let embedding_backfill_interval_secs = settings.embedding_backfill_interval_secs;
 
     let mut tasks = Vec::new();
-    if forget_sweep_interval_secs > 0 {
+    if maintenance_enabled && forget_sweep_interval_secs > 0 {
         let reader = reader.clone();
         let writer = writer.clone();
         tasks.push(tokio::spawn(async move {
@@ -463,7 +472,7 @@ fn start_maintenance_scheduler(
         }));
     }
 
-    if lint_interval_secs > 0 {
+    if maintenance_enabled && lint_interval_secs > 0 {
         let reader = reader.clone();
         let wiki = wiki.clone();
         let llm = llm.clone();
@@ -492,7 +501,7 @@ fn start_maintenance_scheduler(
         }));
     }
 
-    if embedding_backfill_interval_secs > 0 {
+    if maintenance_enabled && embedding_backfill_interval_secs > 0 {
         if let Some(embedder) = embedder {
             let reader = reader.clone();
             let writer = writer.clone();
@@ -523,6 +532,114 @@ fn start_maintenance_scheduler(
                 "maintenance.embedding_backfill_interval_secs is set but no embedder is configured"
             );
         }
+    }
+
+    let scheduler = auto_improve.scheduler.clone();
+    if !scheduler.enabled || scheduler.interval_secs == 0 || scheduler.max_sessions_per_tick == 0 {
+        info!("auto-improve scheduler disabled; manual auto-improve remains available");
+    } else if let Some(llm) = llm.clone() {
+        let reader = reader.clone();
+        let writer = writer.clone();
+        let wiki = wiki.clone();
+        tasks.push(tokio::spawn(async move {
+            let interval = std::time::Duration::from_secs(scheduler.interval_secs);
+            if let Err(e) = writer
+                .ensure_auto_improve_scheduler_state(workspace_id, project_id)
+                .await
+            {
+                tracing::warn!(error = %e, "scheduled auto-improve state init failed");
+            }
+            loop {
+                tokio::time::sleep(interval).await;
+                if let Err(e) = writer
+                    .ensure_auto_improve_scheduler_state(workspace_id, project_id)
+                    .await
+                {
+                    tracing::warn!(error = %e, "scheduled auto-improve state init failed");
+                    continue;
+                }
+                let candidates = match reader
+                    .auto_improve_candidate_sessions(
+                        workspace_id,
+                        project_id,
+                        scheduler.min_session_age_secs,
+                        scheduler.max_sessions_per_tick,
+                    )
+                    .await
+                {
+                    Ok(candidates) => candidates,
+                    Err(e) => {
+                        tracing::warn!(error = %e, "scheduled auto-improve candidate query failed");
+                        continue;
+                    }
+                };
+                if candidates.is_empty() {
+                    tracing::debug!("scheduled auto-improve found no eligible sessions");
+                    continue;
+                }
+                let mut reviewed = 0usize;
+                let ctx = ScheduledAutoImproveContext {
+                    reader: &reader,
+                    writer: &writer,
+                    wiki: &wiki,
+                    llm: &llm,
+                    workspace_id,
+                    project_id,
+                    settings: &auto_improve,
+                };
+                for candidate in candidates {
+                    let claimed = match ctx
+                        .writer
+                        .claim_auto_improve_scheduler_session(
+                            ctx.workspace_id,
+                            ctx.project_id,
+                            candidate.session_id,
+                            candidate.ended_at,
+                        )
+                        .await
+                    {
+                        Ok(claimed) => claimed,
+                        Err(e) => {
+                            tracing::warn!(
+                                session_id = %candidate.session_id,
+                                error = %e,
+                                "scheduled auto-improve claim failed"
+                            );
+                            continue;
+                        }
+                    };
+                    if !claimed {
+                        tracing::debug!(
+                            session_id = %candidate.session_id,
+                            "scheduled auto-improve candidate already claimed or reviewed"
+                        );
+                        continue;
+                    }
+                    match run_scheduled_auto_improve(&ctx, candidate.session_id).await {
+                        Ok(outcome) => {
+                            reviewed += 1;
+                            info!(
+                                session_id = %candidate.session_id,
+                                run_id = %outcome.run_id,
+                                proposals = outcome.proposals,
+                                approved = outcome.approved,
+                                pending = outcome.pending,
+                                conflicts = outcome.conflicts,
+                                "scheduled auto-improve completed"
+                            );
+                        }
+                        Err(e) => tracing::warn!(
+                            session_id = %candidate.session_id,
+                            error = %e,
+                            "scheduled auto-improve failed"
+                        ),
+                    }
+                }
+                info!(reviewed, "scheduled auto-improve tick completed");
+            }
+        }));
+    } else {
+        info!("auto-improve scheduler enabled but no LLM provider is configured; job not started");
     }
 
     if tasks.is_empty() {
@@ -612,6 +729,161 @@ async fn flush_embedding_batch(
     } else {
         *embedded += count;
     }
+}
+
+struct ScheduledAutoImproveOutcome {
+    run_id: ai_memory_core::AutoImproveRunId,
+    proposals: usize,
+    approved: usize,
+    pending: usize,
+    conflicts: usize,
+}
+
+struct ScheduledAutoImproveContext<'a> {
+    reader: &'a ReaderPool,
+    writer: &'a WriterHandle,
+    wiki: &'a Wiki,
+    llm: &'a Arc<dyn LlmProvider>,
+    workspace_id: WorkspaceId,
+    project_id: ProjectId,
+    settings: &'a AutoImproveSettings,
+}
+
+async fn run_scheduled_auto_improve(
+    ctx: &ScheduledAutoImproveContext<'_>,
+    session_id: SessionId,
+) -> Result<ScheduledAutoImproveOutcome> {
+    let cfg = AutoImproveReviewConfig {
+        min_observations: ctx.settings.min_observations,
+        min_session_duration_secs: ctx.settings.min_session_duration_secs,
+        min_confidence: ctx.settings.min_confidence,
+        max_input_tokens: ctx.settings.max_input_tokens,
+        max_proposals_per_run: ctx.settings.max_proposals_per_run,
+        include_raw_fallback: ctx.settings.include_raw_fallback,
+        proposal_actor: ctx.settings.proposal_actor.clone(),
+        pending_path: ctx.settings.pending_path.clone(),
+    };
+    let report = run_auto_improve_review(
+        ctx.reader,
+        &**ctx.llm,
+        ctx.workspace_id,
+        ctx.project_id,
+        session_id,
+        cfg.clone(),
+    )
+    .await?;
+    let proposals =
+        scheduled_auto_improve_new_proposals(ctx.reader, ctx.workspace_id, ctx.project_id, &report)
+            .await?;
+    let staged = ctx
+        .writer
+        .stage_auto_improve_run(StageAutoImproveRun {
+            workspace_id: ctx.workspace_id,
+            project_id: ctx.project_id,
+            session_id: Some(session_id),
+            provider: Some(report.provider.clone()),
+            model: Some(report.model.clone()),
+            summary: Some(report.summary.clone()),
+            warnings_json: serde_json::to_value(&report.warnings)
+                .unwrap_or_else(|_| serde_json::json!([])),
+            rejected_candidates_json: serde_json::to_value(&report.rejected_candidates)
+                .unwrap_or_else(|_| serde_json::json!([])),
+            config_json: serde_json::json!({
+                "trigger": "scheduler",
+                "min_observations": cfg.min_observations,
+                "min_session_duration_secs": cfg.min_session_duration_secs,
+                "min_confidence": cfg.min_confidence,
+                "max_input_tokens": cfg.max_input_tokens,
+                "max_proposals_per_run": cfg.max_proposals_per_run,
+                "include_raw_fallback": cfg.include_raw_fallback,
+                "require_approval": ctx.settings.require_approval,
+            }),
+            proposal_actor: ActorContext {
+                agent: Some(cfg.proposal_actor.clone()),
+                ..ActorContext::default()
+            },
+            proposals,
+        })
+        .await?;
+
+    for id in &staged.proposal_ids {
+        ctx.wiki
+            .write_auto_improve_sidecar(ctx.workspace_id, ctx.project_id, *id)
+            .await?;
+    }
+
+    let mut approved = 0usize;
+    let mut pending = 0usize;
+    let mut conflicts = 0usize;
+    for proposal_id in &staged.proposal_ids {
+        if ctx.settings.require_approval {
+            pending += 1;
+            continue;
+        }
+        match ctx
+            .wiki
+            .approve_auto_improve_proposal(
+                ctx.workspace_id,
+                ctx.project_id,
+                *proposal_id,
+                ActorContext {
+                    agent: Some("auto_improve_scheduler_auto_approve".into()),
+                    ..ActorContext::default()
+                },
+                None,
+                Some(ai_memory_wiki::AdmissionContext {
+                    op: ai_memory_wiki::AdmissionOp::WritePage,
+                    ..ai_memory_wiki::AdmissionContext::default()
+                }),
+            )
+            .await?
+        {
+            ApproveAutoImproveProposalResult::Approved { .. } => approved += 1,
+            ApproveAutoImproveProposalResult::Conflict => conflicts += 1,
+        }
+    }
+
+    Ok(ScheduledAutoImproveOutcome {
+        run_id: staged.run_id,
+        proposals: staged.proposal_ids.len(),
+        approved,
+        pending,
+        conflicts,
+    })
+}
+
+async fn scheduled_auto_improve_new_proposals(
+    reader: &ReaderPool,
+    workspace_id: WorkspaceId,
+    project_id: ProjectId,
+    report: &ai_memory_consolidate::AutoImproveReport,
+) -> Result<Vec<NewAutoImproveProposal>> {
+    let mut proposals = Vec::with_capacity(report.proposals.len());
+    for p in &report.proposals {
+        let path = PagePath::new(p.path.clone())?;
+        let operation = if reader
+            .page_body_by_ids(workspace_id, project_id, path.as_str())
+            .await?
+            .is_some()
+        {
+            AutoImproveProposalOperation::Update
+        } else {
+            AutoImproveProposalOperation::Create
+        };
+        proposals.push(NewAutoImproveProposal {
+            operation,
+            target_path: path,
+            kind: p.kind.clone(),
+            title: p.title.clone(),
+            confidence: f64::from(p.confidence),
+            rationale: p.rationale.clone(),
+            evidence_json: serde_json::to_value(&p.evidence)
+                .unwrap_or_else(|_| serde_json::json!([])),
+            body_markdown: p.body_markdown.clone(),
+            artifact_sha256: None,
+        });
+    }
+    Ok(proposals)
 }
 
 async fn configure_embedder(

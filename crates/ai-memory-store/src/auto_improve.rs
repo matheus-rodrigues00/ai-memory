@@ -203,6 +203,83 @@ pub fn artifact_path_for(proposal_id: AutoImproveProposalId) -> String {
     format!("_pending/auto-improve/{proposal_id}.md")
 }
 
+pub fn ensure_scheduler_state(
+    conn: &mut Connection,
+    workspace_id: WorkspaceId,
+    project_id: ProjectId,
+) -> StoreResult<()> {
+    let now = Timestamp::now().as_microsecond();
+    let watermark_ended_at = conn.query_row(
+        "SELECT COALESCE(MAX(ended_at), 0) FROM sessions \
+         WHERE workspace_id = ?1 AND project_id = ?2 AND ended_at IS NOT NULL",
+        params![workspace_id.as_bytes(), project_id.as_bytes()],
+        |row| row.get::<_, i64>(0),
+    )?;
+    conn.execute(
+        "INSERT INTO auto_improve_scheduler_state \
+         (workspace_id, project_id, watermark_ended_at, initialized_at, updated_at) \
+         VALUES (?1, ?2, ?3, ?4, ?4) \
+         ON CONFLICT(workspace_id, project_id) DO NOTHING",
+        params![
+            workspace_id.as_bytes(),
+            project_id.as_bytes(),
+            watermark_ended_at,
+            now,
+        ],
+    )?;
+    Ok(())
+}
+
+pub fn claim_scheduler_session(
+    conn: &mut Connection,
+    workspace_id: WorkspaceId,
+    project_id: ProjectId,
+    session_id: SessionId,
+    ended_at: i64,
+) -> StoreResult<bool> {
+    let now = Timestamp::now().as_microsecond();
+    let tx = conn.transaction()?;
+    let inserted = tx.execute(
+        "INSERT OR IGNORE INTO auto_improve_scheduler_claims \
+         (workspace_id, project_id, session_id, claimed_at) \
+         SELECT ?1, ?2, ?3, ?4 \
+         WHERE EXISTS ( \
+             SELECT 1 FROM auto_improve_scheduler_state st \
+             JOIN sessions s \
+               ON s.workspace_id = st.workspace_id \
+              AND s.project_id = st.project_id \
+             WHERE st.workspace_id = ?1 \
+               AND st.project_id = ?2 \
+               AND s.id = ?3 \
+               AND s.ended_at = ?5 \
+               AND s.ended_at > st.watermark_ended_at \
+         ) \
+           AND NOT EXISTS ( \
+               SELECT 1 FROM auto_improve_runs r \
+               WHERE r.workspace_id = ?1 \
+                 AND r.project_id = ?2 \
+                 AND r.session_id = ?3 \
+           )",
+        params![
+            workspace_id.as_bytes(),
+            project_id.as_bytes(),
+            session_id.as_bytes(),
+            now,
+            ended_at,
+        ],
+    )?;
+    if inserted == 1 {
+        tx.execute(
+            "UPDATE auto_improve_scheduler_state \
+             SET updated_at = ?3 \
+             WHERE workspace_id = ?1 AND project_id = ?2",
+            params![workspace_id.as_bytes(), project_id.as_bytes(), now],
+        )?;
+    }
+    tx.commit()?;
+    Ok(inserted == 1)
+}
+
 pub fn stage_run(
     conn: &mut Connection,
     input: &StageAutoImproveRun,

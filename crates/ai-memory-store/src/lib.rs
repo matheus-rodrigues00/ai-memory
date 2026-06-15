@@ -35,9 +35,9 @@ pub use decay::{DecayParams, retention_score};
 pub use error::{StoreError, StoreResult};
 pub use ops::{EmbeddingWrite, MoveSummary, PurgeSummary, ReorgSummary};
 pub use reader::{
-    ActivityWindow, BriefingPage, BriefingSnapshot, DecayCandidate, DerivedIndexStatus,
-    EmbeddingTripleCount, HealthDetail, HealthPage, ObservationHit, PageAuthor, PageHit,
-    PageHitWithMeta, PageLinks, PageMeta, PageSummary, ProjectSummary, ReaderPool,
+    ActivityWindow, AutoImproveCandidateSession, BriefingPage, BriefingSnapshot, DecayCandidate,
+    DerivedIndexStatus, EmbeddingTripleCount, HealthDetail, HealthPage, ObservationHit, PageAuthor,
+    PageHit, PageHitWithMeta, PageLinks, PageMeta, PageSummary, ProjectSummary, ReaderPool,
     ReindexTargetStatus, RelatedPage, ScopeRow, StatusCounts, StoredEmbedding, StoredPageBody,
     WorkspaceScopeRow, WorkspaceSummary, f32_vec_to_bytes,
 };
@@ -789,6 +789,48 @@ mod tests {
             .get_or_create_project(src_ws, "app", None)
             .await
             .unwrap();
+        store
+            .writer
+            .ensure_auto_improve_scheduler_state(src_ws, proj)
+            .await
+            .unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+        let claimed_session = SessionId::new();
+        store
+            .writer
+            .begin_session(NewSession {
+                id: claimed_session,
+                workspace_id: src_ws,
+                project_id: proj,
+                agent_kind: AgentKind::OpenCode,
+                cwd: None,
+            })
+            .await
+            .unwrap();
+        store
+            .writer
+            .end_session(claimed_session, None)
+            .await
+            .unwrap();
+        let candidate = store
+            .reader
+            .auto_improve_candidate_sessions(src_ws, proj, 0, 1)
+            .await
+            .unwrap()
+            .pop()
+            .unwrap();
+        assert!(
+            store
+                .writer
+                .claim_auto_improve_scheduler_session(
+                    src_ws,
+                    proj,
+                    candidate.session_id,
+                    candidate.ended_at,
+                )
+                .await
+                .unwrap()
+        );
         let proposal_id = store
             .writer
             .stage_auto_improve_run(stage_input(
@@ -810,6 +852,8 @@ mod tests {
             .unwrap();
         assert_eq!(summary.auto_improve_runs_moved, 1);
         assert_eq!(summary.auto_improve_proposals_moved, 1);
+        assert_eq!(summary.auto_improve_scheduler_state_moved, 1);
+        assert_eq!(summary.auto_improve_scheduler_claims_moved, 1);
         assert!(
             store
                 .reader
@@ -825,6 +869,15 @@ mod tests {
                 .await
                 .unwrap()
                 .is_some()
+        );
+        assert!(
+            store
+                .reader
+                .auto_improve_candidate_sessions(dst_ws, proj, 0, 10)
+                .await
+                .unwrap()
+                .is_empty(),
+            "moved scheduler claims should keep claimed sessions suppressed"
         );
     }
 
@@ -1468,6 +1521,446 @@ mod tests {
                 .unwrap(),
             Some(first)
         );
+    }
+
+    #[tokio::test]
+    async fn auto_improve_scheduler_candidates_respect_watermark_age_and_runs() {
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let ws = store
+            .writer
+            .get_or_create_workspace("default")
+            .await
+            .unwrap();
+        let proj = store
+            .writer
+            .get_or_create_project(ws, "ai-memory", None)
+            .await
+            .unwrap();
+
+        let historical = SessionId::new();
+        store
+            .writer
+            .begin_session(NewSession {
+                id: historical,
+                workspace_id: ws,
+                project_id: proj,
+                agent_kind: AgentKind::OpenCode,
+                cwd: None,
+            })
+            .await
+            .unwrap();
+        store.writer.end_session(historical, None).await.unwrap();
+
+        store
+            .writer
+            .ensure_auto_improve_scheduler_state(ws, proj)
+            .await
+            .unwrap();
+        // Restart/idempotency: the second call must not reset the watermark.
+        store
+            .writer
+            .ensure_auto_improve_scheduler_state(ws, proj)
+            .await
+            .unwrap();
+
+        tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+
+        let fresh_after_watermark = SessionId::new();
+        let open_after_watermark = SessionId::new();
+        for id in [fresh_after_watermark, open_after_watermark] {
+            store
+                .writer
+                .begin_session(NewSession {
+                    id,
+                    workspace_id: ws,
+                    project_id: proj,
+                    agent_kind: AgentKind::OpenCode,
+                    cwd: None,
+                })
+                .await
+                .unwrap();
+        }
+        store
+            .writer
+            .end_session(fresh_after_watermark, None)
+            .await
+            .unwrap();
+
+        assert!(
+            store
+                .reader
+                .auto_improve_candidate_sessions(ws, proj, 86_400, 10)
+                .await
+                .unwrap()
+                .is_empty(),
+            "too-fresh completed sessions must not be candidates"
+        );
+
+        let candidates = store
+            .reader
+            .auto_improve_candidate_sessions(ws, proj, 0, 10)
+            .await
+            .unwrap();
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].session_id, fresh_after_watermark);
+
+        assert!(
+            store
+                .writer
+                .claim_auto_improve_scheduler_session(
+                    ws,
+                    proj,
+                    candidates[0].session_id,
+                    candidates[0].ended_at,
+                )
+                .await
+                .unwrap(),
+            "first scheduler claim should be recorded"
+        );
+        assert!(
+            !store
+                .writer
+                .claim_auto_improve_scheduler_session(
+                    ws,
+                    proj,
+                    candidates[0].session_id,
+                    candidates[0].ended_at,
+                )
+                .await
+                .unwrap(),
+            "duplicate scheduler claims should be rejected"
+        );
+        assert!(
+            store
+                .reader
+                .auto_improve_candidate_sessions(ws, proj, 0, 10)
+                .await
+                .unwrap()
+                .is_empty(),
+            "claimed sessions must not be retried if review fails before staging"
+        );
+
+        tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+        let reviewed_after_watermark = SessionId::new();
+        store
+            .writer
+            .begin_session(NewSession {
+                id: reviewed_after_watermark,
+                workspace_id: ws,
+                project_id: proj,
+                agent_kind: AgentKind::OpenCode,
+                cwd: None,
+            })
+            .await
+            .unwrap();
+        store
+            .writer
+            .end_session(reviewed_after_watermark, None)
+            .await
+            .unwrap();
+
+        store
+            .writer
+            .stage_auto_improve_run(StageAutoImproveRun {
+                workspace_id: ws,
+                project_id: proj,
+                session_id: Some(reviewed_after_watermark),
+                provider: Some("none".into()),
+                model: Some("none".into()),
+                summary: Some("reviewed".into()),
+                warnings_json: serde_json::json!([]),
+                rejected_candidates_json: serde_json::json!([]),
+                config_json: serde_json::json!({ "trigger": "scheduler" }),
+                proposal_actor: ActorContext {
+                    agent: Some("auto_improve".into()),
+                    ..ActorContext::default()
+                },
+                proposals: Vec::new(),
+            })
+            .await
+            .unwrap();
+
+        assert!(
+            store
+                .reader
+                .auto_improve_candidate_sessions(ws, proj, 0, 10)
+                .await
+                .unwrap()
+                .is_empty(),
+            "any recorded run row suppresses scheduler retry for v1"
+        );
+    }
+
+    #[tokio::test]
+    async fn auto_improve_scheduler_claims_do_not_skip_same_ended_at_sessions() {
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let ws = store
+            .writer
+            .get_or_create_workspace("default")
+            .await
+            .unwrap();
+        let proj = store
+            .writer
+            .get_or_create_project(ws, "ai-memory", None)
+            .await
+            .unwrap();
+        store
+            .writer
+            .ensure_auto_improve_scheduler_state(ws, proj)
+            .await
+            .unwrap();
+
+        tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+        let first = SessionId::new();
+        let second = SessionId::new();
+        for id in [first, second] {
+            store
+                .writer
+                .begin_session(NewSession {
+                    id,
+                    workspace_id: ws,
+                    project_id: proj,
+                    agent_kind: AgentKind::OpenCode,
+                    cwd: None,
+                })
+                .await
+                .unwrap();
+            store.writer.end_session(id, None).await.unwrap();
+        }
+
+        let same_ended_at = jiff::Timestamp::now().as_microsecond();
+        let conn = Connection::open(store.db_path()).unwrap();
+        conn.execute(
+            "UPDATE sessions SET ended_at = ?1 WHERE id IN (?2, ?3)",
+            params![same_ended_at, first.as_bytes(), second.as_bytes()],
+        )
+        .unwrap();
+
+        let candidates = store
+            .reader
+            .auto_improve_candidate_sessions(ws, proj, 0, 10)
+            .await
+            .unwrap();
+        assert_eq!(candidates.len(), 2);
+        assert!(
+            store
+                .writer
+                .claim_auto_improve_scheduler_session(
+                    ws,
+                    proj,
+                    candidates[0].session_id,
+                    candidates[0].ended_at,
+                )
+                .await
+                .unwrap()
+        );
+
+        let remaining = store
+            .reader
+            .auto_improve_candidate_sessions(ws, proj, 0, 10)
+            .await
+            .unwrap();
+        assert_eq!(remaining.len(), 1);
+        assert_ne!(remaining[0].session_id, candidates[0].session_id);
+        assert_eq!(remaining[0].ended_at, same_ended_at);
+    }
+
+    #[tokio::test]
+    async fn auto_improve_scheduler_claim_is_unique_across_store_instances() {
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let ws = store
+            .writer
+            .get_or_create_workspace("default")
+            .await
+            .unwrap();
+        let proj = store
+            .writer
+            .get_or_create_project(ws, "ai-memory", None)
+            .await
+            .unwrap();
+        store
+            .writer
+            .ensure_auto_improve_scheduler_state(ws, proj)
+            .await
+            .unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+
+        let session_id = SessionId::new();
+        store
+            .writer
+            .begin_session(NewSession {
+                id: session_id,
+                workspace_id: ws,
+                project_id: proj,
+                agent_kind: AgentKind::OpenCode,
+                cwd: None,
+            })
+            .await
+            .unwrap();
+        store.writer.end_session(session_id, None).await.unwrap();
+        let ended_at = store
+            .reader
+            .auto_improve_candidate_sessions(ws, proj, 0, 1)
+            .await
+            .unwrap()[0]
+            .ended_at;
+
+        let second_store = Store::open(tmp.path()).unwrap();
+        let (first, second) = tokio::join!(
+            store
+                .writer
+                .claim_auto_improve_scheduler_session(ws, proj, session_id, ended_at),
+            second_store
+                .writer
+                .claim_auto_improve_scheduler_session(ws, proj, session_id, ended_at),
+        );
+        let claimed = [first.unwrap(), second.unwrap()];
+        assert_eq!(claimed.into_iter().filter(|claimed| *claimed).count(), 1);
+
+        let conn = Connection::open(store.db_path()).unwrap();
+        let claim_rows: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM auto_improve_scheduler_claims WHERE session_id = ?1",
+                params![session_id.as_bytes()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(claim_rows, 1);
+    }
+
+    #[tokio::test]
+    async fn v103_schema_upgrades_to_current_without_backlog_or_integrity_breaks() {
+        let tmp = TempDir::new().unwrap();
+        let db_dir = tmp.path().join("db");
+        std::fs::create_dir_all(&db_dir).unwrap();
+        let db_path = db_dir.join(DB_FILENAME);
+
+        let session_id = SessionId::new();
+        {
+            let mut conn = Connection::open(&db_path).unwrap();
+            conn.pragma_update(None, "foreign_keys", "OFF").unwrap();
+            super::migrations::run_to(&mut conn, 19).unwrap();
+            conn.pragma_update(None, "foreign_keys", "ON").unwrap();
+
+            let ws = super::ops::get_or_create_workspace(&mut conn, "default").unwrap();
+            let proj =
+                super::ops::get_or_create_project(&mut conn, &ws, "ai-memory", None).unwrap();
+            let page_id = super::ops::upsert_page(
+                &mut conn,
+                &sample_page(ws, proj, "notes/v103.md", "v1.0.3 upgrade fixture"),
+            )
+            .unwrap();
+            super::ops::begin_session(
+                &mut conn,
+                &NewSession {
+                    id: session_id,
+                    workspace_id: ws,
+                    project_id: proj,
+                    agent_kind: AgentKind::OpenCode,
+                    cwd: None,
+                },
+            )
+            .unwrap();
+            super::ops::insert_observation(
+                &mut conn,
+                &NewObservation {
+                    session_id,
+                    workspace_id: ws,
+                    project_id: proj,
+                    kind: ObservationKind::UserPrompt,
+                    extension: None,
+                    source_event: None,
+                    title: "prompt".into(),
+                    body: "upgrade observation survives".into(),
+                    importance: 5,
+                },
+            )
+            .unwrap();
+            super::ops::end_session(&mut conn, &session_id, Some(&page_id)).unwrap();
+        }
+
+        let store = Store::open(tmp.path()).unwrap();
+        let ws = store
+            .writer
+            .get_or_create_workspace("default")
+            .await
+            .unwrap();
+        let proj = store
+            .writer
+            .get_or_create_project(ws, "ai-memory", None)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            store
+                .reader
+                .latest_completed_session_for_project(ws, proj)
+                .await
+                .unwrap(),
+            Some(session_id)
+        );
+        assert_eq!(
+            store
+                .reader
+                .search_observations_for_project(ws, proj, "upgrade".into(), 10)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+        let page = store
+            .reader
+            .page_body_by_ids(ws, proj, "notes/v103.md")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(page.body, "v1.0.3 upgrade fixture");
+
+        store
+            .writer
+            .ensure_auto_improve_scheduler_state(ws, proj)
+            .await
+            .unwrap();
+        assert!(
+            store
+                .reader
+                .auto_improve_candidate_sessions(ws, proj, 0, 10)
+                .await
+                .unwrap()
+                .is_empty(),
+            "v1.0.3-era completed sessions must become the first-run watermark, not backlog"
+        );
+
+        let conn = Connection::open(store.db_path()).unwrap();
+        let integrity: String = conn
+            .query_row("PRAGMA integrity_check", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(integrity, "ok");
+        let fk_violations: i64 = conn
+            .query_row("SELECT COUNT(*) FROM pragma_foreign_key_check", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(fk_violations, 0);
+        for table in [
+            "auto_improve_runs",
+            "auto_improve_proposals",
+            "auto_improve_proposal_events",
+            "auto_improve_scheduler_state",
+            "auto_improve_scheduler_claims",
+        ] {
+            let exists: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = ?1",
+                    params![table],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(exists, 1, "{table} should exist after v1.0.3 upgrade");
+        }
     }
 
     #[tokio::test]

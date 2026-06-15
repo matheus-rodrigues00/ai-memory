@@ -140,11 +140,13 @@ Decay/forget runs as a separate `memory_forget_sweep` job: applies the retention
 Auto-improvement work stays separate from normal session consolidation. The
 reviewer notes and staged design are in
 [`docs/auto-improvement-loop.md`](auto-improvement-loop.md). The short version:
-learning review is default-available when an LLM provider is configured, and
-manual CLI/admin/MCP runs apply validated proposals through the auto-improvement
-approval path by default. Admins can opt into manual review with
-`[auto_improve] require_approval = true`. All writes remain scoped through the
-shared resolver/auth paths and must not mutate the active agent context mid-turn.
+learning review is scheduled for newly completed sessions when an LLM provider
+is configured, and manual CLI/admin/MCP runs remain available for catch-up or
+targeted reruns. Scheduling and approval are separate: `[auto_improve.scheduler]`
+controls background review, while `[auto_improve] require_approval = true` keeps
+scheduled and manual proposals pending for human approval instead of applying
+them automatically. All writes remain scoped through the shared resolver/auth
+paths and must not mutate the active agent context mid-turn.
 
 ## 9. Cross-agent handoff
 
@@ -184,7 +186,7 @@ basic-memory has ~25 tools, agentmemory has 53. Both have user confusion as a re
 | `memory_handoff_accept` | Fetch + ack the latest open handoff | destructive |
 | `memory_handoff_cancel` | Mark an exact mistakenly-created open handoff expired | destructive |
 | `memory_consolidate` | LLM-driven page rewrite (`multi_page=true` for atomic fan-out) | destructive |
-| `memory_auto_improve` | Learning review that applies validated wiki edits through the auto-improvement approval path; manual-review opt-in keeps proposals pending | write |
+| `memory_auto_improve` | Manual learning review for a completed session; the server also schedules review for new sessions, and manual-review opt-in keeps proposals pending | write |
 | `memory_write_page` | Write durable wiki knowledge on explicit user request | destructive |
 | `memory_read_page` | Read a full page body by exact path or top search hit | read-only |
 | `memory_delete_page` | Delete a single exact-path page with admission hooks | destructive |

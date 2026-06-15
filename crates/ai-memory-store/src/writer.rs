@@ -210,6 +210,18 @@ pub(crate) enum WriteCmd {
         input: ApproveAutoImproveProposal,
         reply: oneshot::Sender<StoreResult<ApproveAutoImproveProposalResult>>,
     },
+    EnsureAutoImproveSchedulerState {
+        workspace_id: WorkspaceId,
+        project_id: ProjectId,
+        reply: oneshot::Sender<StoreResult<()>>,
+    },
+    ClaimAutoImproveSchedulerSession {
+        workspace_id: WorkspaceId,
+        project_id: ProjectId,
+        session_id: SessionId,
+        ended_at: i64,
+        reply: oneshot::Sender<StoreResult<bool>>,
+    },
     Shutdown,
 }
 
@@ -852,6 +864,45 @@ impl WriterHandle {
         rx.await.map_err(|_| StoreError::WriterClosed)?
     }
 
+    /// Initialise background auto-improvement scheduler state without resetting
+    /// an existing watermark.
+    pub async fn ensure_auto_improve_scheduler_state(
+        &self,
+        workspace_id: WorkspaceId,
+        project_id: ProjectId,
+    ) -> StoreResult<()> {
+        let (tx, rx) = oneshot::channel();
+        self.send(WriteCmd::EnsureAutoImproveSchedulerState {
+            workspace_id,
+            project_id,
+            reply: tx,
+        })
+        .await?;
+        rx.await.map_err(|_| StoreError::WriterClosed)?
+    }
+
+    /// Atomically claim a completed session for scheduled auto-improvement
+    /// before any LLM work runs. Returns `false` if another scheduler/manual run
+    /// already claimed or reviewed the session.
+    pub async fn claim_auto_improve_scheduler_session(
+        &self,
+        workspace_id: WorkspaceId,
+        project_id: ProjectId,
+        session_id: SessionId,
+        ended_at: i64,
+    ) -> StoreResult<bool> {
+        let (tx, rx) = oneshot::channel();
+        self.send(WriteCmd::ClaimAutoImproveSchedulerSession {
+            workspace_id,
+            project_id,
+            session_id,
+            ended_at,
+            reply: tx,
+        })
+        .await?;
+        rx.await.map_err(|_| StoreError::WriterClosed)?
+    }
+
     async fn send(&self, cmd: WriteCmd) -> StoreResult<()> {
         self.inner
             .tx
@@ -1136,6 +1187,34 @@ fn worker_loop(mut conn: Connection, mut rx: mpsc::Receiver<WriteCmd>) {
             WriteCmd::ApproveAutoImproveProposal { input, reply } => {
                 let result = crate::auto_improve::approve_proposal(&mut conn, &input);
                 send_or_warn(reply, result, "approve_auto_improve_proposal");
+            }
+            WriteCmd::EnsureAutoImproveSchedulerState {
+                workspace_id,
+                project_id,
+                reply,
+            } => {
+                let result = crate::auto_improve::ensure_scheduler_state(
+                    &mut conn,
+                    workspace_id,
+                    project_id,
+                );
+                send_or_warn(reply, result, "ensure_auto_improve_scheduler_state");
+            }
+            WriteCmd::ClaimAutoImproveSchedulerSession {
+                workspace_id,
+                project_id,
+                session_id,
+                ended_at,
+                reply,
+            } => {
+                let result = crate::auto_improve::claim_scheduler_session(
+                    &mut conn,
+                    workspace_id,
+                    project_id,
+                    session_id,
+                    ended_at,
+                );
+                send_or_warn(reply, result, "claim_auto_improve_scheduler_session");
             }
         }
     }

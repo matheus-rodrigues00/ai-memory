@@ -129,17 +129,23 @@ priors are at the [bottom](#influences-and-prior-art).
   one-shot-summarises them into seed wiki pages. Future sessions
   build on top.
 - **"What durable lesson did that session teach?"**
-  `ai-memory auto-improve --session-id <uuid>` reviews one completed session
-  with the configured LLM, records proposed wiki edits in the pending-writes
-  audit trail, and approves them immediately through the normal wiki write path.
-  Agents can also call `memory_auto_improve` to review the latest completed
-  session in the current project without knowing the session id. If you want a
-  human review queue instead, set `[auto_improve] require_approval = true` and
-  use `pending-writes list`/`show`/`diff`/`approve`/`reject`.
+  When an LLM provider is configured, ai-memory runs a background
+  auto-improvement scheduler for newly completed sessions. It records proposed
+  wiki edits in the pending-writes audit trail, then approves them immediately
+  through the normal wiki write path by default. Scheduling and approval are
+  separate: set `[auto_improve.scheduler] enabled = false` to stop automatic
+  review, or set `[auto_improve] require_approval = true` to keep both scheduled
+  and manual proposals pending for human review. `ai-memory auto-improve
+  --session-id <uuid>` and MCP `memory_auto_improve` remain available for manual
+  catch-up or targeted reruns.
 
-  Existing installs do not need per-project migration. Older configs may still
-  contain an `[auto_improve] mode = ...` line; current ai-memory ignores that
-  legacy key, so you can remove it when convenient.
+  Existing installs do not need per-project migration. The scheduler initializes
+  a per-project first-run watermark so historical sessions are not reviewed
+  automatically on upgrade, then records per-session claims so failed scheduled
+  reviews do not retry forever; use manual auto-improve for old sessions or
+  failed scheduled sessions you want to catch up. Older configs may still contain
+  an `[auto_improve] mode = ...` line; current ai-memory ignores that legacy key,
+  so you can remove it when convenient.
 - **"What housekeeping should I consider?"**
   `ai-memory curator` runs a no-LLM, rule-based maintenance report over cold
   episodic pages, stale slots, duplicate exact normalized titles, and dangling
@@ -556,7 +562,7 @@ diagram, crate breakdown, schema notes, and invariants.
 | [`docs/users.md`](docs/users.md) | **Multi-user attribution (v0.8).** Four-rung auth ladder, `ai-memory user add/list/expire/revive/rotate-token` walkthrough, backward-compat migration for pre-v0.8 installs, token storage rationale. |
 | [`docs/https-via-proxy.md`](docs/https-via-proxy.md) | **HTTPS via a reverse proxy.** When you need TLS (multi-user, non-loopback) and when you don't (loopback / stdio). Copy-paste docker compose templates for Caddy + Let's Encrypt, Caddy + internal CA (LAN-only), Cloudflare Tunnel (no open ports), and external cert files; plus native-Caddy + nginx recipes. The "thinking you're secure when you're not" failure modes explicitly called out. |
 | [`docs/lifecycle-ops.md`](docs/lifecycle-ops.md) | **Read before running purge / rename / backup / restore / reset / reindex / restore-page.** Safety matrix for state-touching commands, per-project disk layout (how isolation actually works), checkpoint-based page recovery, and operator workflows for "fresh start", "snapshot before risky op", "drop one project", and rebuilding SQLite from wiki files. |
-| [`docs/auto-improvement-loop.md`](docs/auto-improvement-loop.md) | Auto-improvement design notes: Hermes-inspired post-session review, auto-approval default, manual review opt-in, pending proposal storage, and curator work. |
+| [`docs/auto-improvement-loop.md`](docs/auto-improvement-loop.md) | Auto-improvement design notes: Hermes-inspired scheduled review, auto-approval default, manual review opt-in, pending proposal storage, and curator work. |
 | [`docs/llm-provider-comparison.md`](docs/llm-provider-comparison.md) | Empirical notes behind the recommended LLM defaults. |
 | [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) | Operational summary: data flow, crate layout, cross-cutting invariants, schema. |
 | [`docs/design-decisions.md`](docs/design-decisions.md) | The full v1 spec. |
