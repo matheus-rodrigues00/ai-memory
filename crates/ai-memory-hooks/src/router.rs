@@ -526,23 +526,14 @@ async fn resolve_project_ids(
         // matching later compares the stored `repo_path` against the raw hook
         // cwd, so keep the repo root in the same spelling/namespace as `cwd`
         // whenever canonical paths prove that `cwd` is inside `repo_root`.
-        if let (Ok(cwd_canon), Ok(root_canon)) =
-            (std::fs::canonicalize(cwd), std::fs::canonicalize(repo_root))
-            && let Ok(rel) = cwd_canon.strip_prefix(&root_canon)
-        {
-            let mut visible_root = cwd.to_path_buf();
-            for component in rel.components() {
-                match component {
-                    std::path::Component::Normal(_) => {
-                        if !visible_root.pop() {
-                            return repo_root.to_path_buf();
-                        }
-                    }
-                    std::path::Component::CurDir => {}
-                    _ => return repo_root.to_path_buf(),
+        if let Ok(root_canon) = std::fs::canonicalize(repo_root) {
+            for ancestor in cwd.ancestors() {
+                if let Ok(ancestor_canon) = std::fs::canonicalize(ancestor)
+                    && ancestor_canon == root_canon
+                {
+                    return ancestor.to_path_buf();
                 }
             }
-            return visible_root;
         }
         repo_root.to_path_buf()
     }
