@@ -188,6 +188,42 @@ pub struct AutoImproveRejectionSummary {
     pub created_at: i64,
 }
 
+/// Aggregate telemetry for auto-improvement runs in one scope.
+#[derive(Debug, Clone, Serialize)]
+pub struct AutoImproveTelemetryAggregate {
+    /// Number of auto-improve runs in the window.
+    pub run_count: usize,
+    /// Number of runs that staged at least one learning proposal.
+    pub runs_with_learning_proposals: usize,
+    /// Learning proposal counts by status.
+    pub proposals_by_status: Vec<AutoImproveTelemetryCount>,
+    /// Learning proposal counts by operation.
+    pub proposals_by_operation: Vec<AutoImproveTelemetryCount>,
+    /// Learning proposal counts by edit mode.
+    pub proposals_by_edit_mode: Vec<AutoImproveTelemetryCount>,
+    /// Learning proposal counts by kind.
+    pub proposals_by_kind: Vec<AutoImproveTelemetryCount>,
+    /// Maintenance/report proposal counts by kind.
+    pub maintenance_proposals_by_kind: Vec<AutoImproveTelemetryCount>,
+    /// Most frequently targeted learning pages.
+    pub top_targets: Vec<AutoImproveTelemetryCount>,
+    /// Rejection counts by reason.
+    pub rejections_by_reason: Vec<AutoImproveTelemetryCount>,
+    /// Repeated rejection fingerprints.
+    pub repeated_rejection_fingerprints: Vec<AutoImproveTelemetryCount>,
+    /// Most common rejected targets.
+    pub rejected_targets: Vec<AutoImproveTelemetryCount>,
+}
+
+/// Generic `(key, count)` telemetry row.
+#[derive(Debug, Clone, Serialize)]
+pub struct AutoImproveTelemetryCount {
+    /// Aggregated key; field-specific meaning depends on the source vector.
+    pub key: String,
+    /// Number of rows matching the key.
+    pub count: usize,
+}
+
 #[derive(Debug, Clone)]
 pub struct RejectAutoImproveProposal {
     pub workspace_id: WorkspaceId,

@@ -9,6 +9,7 @@
 //! M7b extends this to multi-page atomic fan-out.
 
 pub mod auto_improve;
+pub mod auto_improve_telemetry;
 pub mod bootstrap;
 pub mod consolidator;
 pub mod curator;
@@ -31,6 +32,12 @@ pub use auto_improve::{
     DEFAULT_AUTO_IMPROVE_PENDING_PATH, DEFAULT_AUTO_IMPROVE_PROPOSAL_ACTOR,
     DEFAULT_AUTO_IMPROVE_REJECTION_CONTEXT_DAYS, default_auto_improve_eval_targets,
     run_auto_improve_review,
+};
+pub use auto_improve_telemetry::{
+    AutoImproveTelemetryFinding, AutoImproveTelemetryParams, AutoImproveTelemetryReport,
+    AutoImproveTerminalRates, DEFAULT_AUTO_IMPROVE_TELEMETRY_SINCE_DAYS,
+    DEFAULT_AUTO_IMPROVE_TELEMETRY_TOP_LIMIT, build_auto_improve_telemetry_report,
+    render_auto_improve_telemetry_report_markdown, run_auto_improve_telemetry_report,
 };
 pub use bootstrap::{
     Bootstrap, BootstrapConfig, BootstrapError, BootstrapOutcome, BootstrapSource,

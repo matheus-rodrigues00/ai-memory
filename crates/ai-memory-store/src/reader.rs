@@ -27,8 +27,8 @@ use uuid::Uuid;
 
 use crate::auto_improve::{
     AutoImproveProposalDetail, AutoImproveProposalEvent, AutoImproveProposalStatus,
-    AutoImproveProposalSummary, AutoImproveRejectionSummary, bytes32, opt_bytes32,
-    summary_from_row, to_sql_err,
+    AutoImproveProposalSummary, AutoImproveRejectionSummary, AutoImproveTelemetryAggregate,
+    AutoImproveTelemetryCount, bytes32, opt_bytes32, summary_from_row, to_sql_err,
 };
 use crate::error::{StoreError, StoreResult};
 use crate::fts_query::prepare_fts5_query;
@@ -3275,6 +3275,124 @@ impl ReaderPool {
         .await
     }
 
+    /// Aggregate auto-improvement telemetry for one workspace/project scope.
+    ///
+    /// `since_created_at` filters by run/proposal/rejection creation time in Unix
+    /// microseconds. Maintenance/report proposals are excluded from learning
+    /// metrics and counted separately.
+    pub async fn auto_improve_telemetry_aggregate(
+        &self,
+        workspace_id: WorkspaceId,
+        project_id: ProjectId,
+        since_created_at: i64,
+        top_limit: usize,
+    ) -> StoreResult<AutoImproveTelemetryAggregate> {
+        self.with_conn(move |conn| {
+            let top_limit = i64::try_from(top_limit).unwrap_or(i64::MAX);
+            let run_count: i64 = conn.query_row(
+                "SELECT COUNT(*) FROM auto_improve_runs
+                 WHERE workspace_id = ?1 AND project_id = ?2 AND created_at >= ?3",
+                params![
+                    workspace_id.as_bytes(),
+                    project_id.as_bytes(),
+                    since_created_at
+                ],
+                |row| row.get(0),
+            )?;
+            let runs_with_learning_proposals: i64 = conn.query_row(
+                "SELECT COUNT(DISTINCT run_id) FROM auto_improve_proposals
+                 WHERE workspace_id = ?1 AND project_id = ?2 AND staged_at >= ?3
+                   AND kind NOT IN ('curator_report', 'auto_improve_report')",
+                params![
+                    workspace_id.as_bytes(),
+                    project_id.as_bytes(),
+                    since_created_at
+                ],
+                |row| row.get(0),
+            )?;
+            Ok(AutoImproveTelemetryAggregate {
+                run_count: usize::try_from(run_count).unwrap_or(usize::MAX),
+                runs_with_learning_proposals: usize::try_from(runs_with_learning_proposals)
+                    .unwrap_or(usize::MAX),
+                proposals_by_status: auto_improve_group_counts(
+                    conn,
+                    "status",
+                    workspace_id,
+                    project_id,
+                    since_created_at,
+                    None,
+                )?,
+                proposals_by_operation: auto_improve_group_counts(
+                    conn,
+                    "operation",
+                    workspace_id,
+                    project_id,
+                    since_created_at,
+                    None,
+                )?,
+                proposals_by_edit_mode: auto_improve_group_counts(
+                    conn,
+                    "edit_mode",
+                    workspace_id,
+                    project_id,
+                    since_created_at,
+                    None,
+                )?,
+                proposals_by_kind: auto_improve_group_counts(
+                    conn,
+                    "kind",
+                    workspace_id,
+                    project_id,
+                    since_created_at,
+                    None,
+                )?,
+                maintenance_proposals_by_kind: auto_improve_group_counts(
+                    conn,
+                    "kind",
+                    workspace_id,
+                    project_id,
+                    since_created_at,
+                    Some("kind IN ('curator_report', 'auto_improve_report')"),
+                )?,
+                top_targets: auto_improve_group_counts(
+                    conn,
+                    "target_path",
+                    workspace_id,
+                    project_id,
+                    since_created_at,
+                    Some("kind NOT IN ('curator_report', 'auto_improve_report')"),
+                )?
+                .into_iter()
+                .take(usize::try_from(top_limit).unwrap_or(usize::MAX))
+                .collect(),
+                rejections_by_reason: auto_improve_rejection_group_counts(
+                    conn,
+                    "reason",
+                    workspace_id,
+                    project_id,
+                    since_created_at,
+                    top_limit,
+                )?,
+                repeated_rejection_fingerprints: auto_improve_repeated_rejection_fingerprints(
+                    conn,
+                    workspace_id,
+                    project_id,
+                    since_created_at,
+                    top_limit,
+                )?,
+                rejected_targets: auto_improve_rejection_group_counts(
+                    conn,
+                    "COALESCE(target_path, '(none)')",
+                    workspace_id,
+                    project_id,
+                    since_created_at,
+                    top_limit,
+                )?,
+            })
+        })
+        .await
+    }
+
     /// Look up a workspace id by name without creating it.
     ///
     /// Returns `None` when no workspace with the given name exists.
@@ -4122,6 +4240,109 @@ fn materialise_decay_candidate(
         access_count: u32::try_from(access_count.max(0)).unwrap_or(u32::MAX),
         last_accessed_at_us,
         frontmatter_json,
+    })
+}
+
+fn auto_improve_group_counts(
+    conn: &Connection,
+    column: &str,
+    workspace_id: WorkspaceId,
+    project_id: ProjectId,
+    since_created_at: i64,
+    extra_where: Option<&str>,
+) -> rusqlite::Result<Vec<AutoImproveTelemetryCount>> {
+    let learning_filter = "kind NOT IN ('curator_report', 'auto_improve_report')";
+    let filter = extra_where.unwrap_or(learning_filter);
+    let sql = format!(
+        "SELECT COALESCE({column}, '(none)') AS key, COUNT(*) AS count
+         FROM auto_improve_proposals
+         WHERE workspace_id = ?1 AND project_id = ?2 AND staged_at >= ?3 AND {filter}
+         GROUP BY key ORDER BY count DESC, key ASC"
+    );
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt.query_map(
+        params![
+            workspace_id.as_bytes(),
+            project_id.as_bytes(),
+            since_created_at
+        ],
+        telemetry_count_from_row,
+    )?;
+    let mut out = Vec::new();
+    for row in rows {
+        out.push(row?);
+    }
+    Ok(out)
+}
+
+fn auto_improve_rejection_group_counts(
+    conn: &Connection,
+    expr: &str,
+    workspace_id: WorkspaceId,
+    project_id: ProjectId,
+    since_created_at: i64,
+    limit: i64,
+) -> rusqlite::Result<Vec<AutoImproveTelemetryCount>> {
+    let sql = format!(
+        "SELECT {expr} AS key, COUNT(*) AS count
+         FROM auto_improve_rejections
+         WHERE workspace_id = ?1 AND project_id = ?2 AND created_at >= ?3
+         GROUP BY key ORDER BY count DESC, key ASC LIMIT ?4"
+    );
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt.query_map(
+        params![
+            workspace_id.as_bytes(),
+            project_id.as_bytes(),
+            since_created_at,
+            limit
+        ],
+        telemetry_count_from_row,
+    )?;
+    let mut out = Vec::new();
+    for row in rows {
+        out.push(row?);
+    }
+    Ok(out)
+}
+
+fn auto_improve_repeated_rejection_fingerprints(
+    conn: &Connection,
+    workspace_id: WorkspaceId,
+    project_id: ProjectId,
+    since_created_at: i64,
+    limit: i64,
+) -> rusqlite::Result<Vec<AutoImproveTelemetryCount>> {
+    let mut stmt = conn.prepare(
+        "SELECT normalized_fingerprint AS key, COUNT(*) AS count
+         FROM auto_improve_rejections
+         WHERE workspace_id = ?1 AND project_id = ?2 AND created_at >= ?3
+         GROUP BY normalized_fingerprint HAVING count > 1
+         ORDER BY count DESC, key ASC LIMIT ?4",
+    )?;
+    let rows = stmt.query_map(
+        params![
+            workspace_id.as_bytes(),
+            project_id.as_bytes(),
+            since_created_at,
+            limit
+        ],
+        telemetry_count_from_row,
+    )?;
+    let mut out = Vec::new();
+    for row in rows {
+        out.push(row?);
+    }
+    Ok(out)
+}
+
+fn telemetry_count_from_row(
+    row: &rusqlite::Row<'_>,
+) -> rusqlite::Result<AutoImproveTelemetryCount> {
+    let count: i64 = row.get(1)?;
+    Ok(AutoImproveTelemetryCount {
+        key: row.get(0)?,
+        count: usize::try_from(count).unwrap_or(usize::MAX),
     })
 }
 

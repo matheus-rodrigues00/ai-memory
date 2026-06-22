@@ -28,9 +28,9 @@ pub use fts_query::prepare_fts5_query;
 pub use auto_improve::{
     ApproveAutoImproveProposal, ApproveAutoImproveProposalResult, AutoImproveProposalDetail,
     AutoImproveProposalEvent, AutoImproveProposalOperation, AutoImproveProposalStatus,
-    AutoImproveProposalSummary, AutoImproveRejectionSummary, FailAutoImproveProposal,
-    NewAutoImproveProposal, RejectAutoImproveProposal, StageAutoImproveRun, StagedAutoImproveRun,
-    artifact_path_for,
+    AutoImproveProposalSummary, AutoImproveRejectionSummary, AutoImproveTelemetryAggregate,
+    AutoImproveTelemetryCount, FailAutoImproveProposal, NewAutoImproveProposal,
+    RejectAutoImproveProposal, StageAutoImproveRun, StagedAutoImproveRun, artifact_path_for,
 };
 pub use decay::{DecayParams, retention_score};
 pub use error::{StoreError, StoreResult};
@@ -208,6 +208,13 @@ mod tests {
             hash.try_into().unwrap(),
             updated,
         )
+    }
+
+    fn telemetry_count(rows: &[AutoImproveTelemetryCount], key: &str) -> usize {
+        rows.iter()
+            .find(|row| row.key == key)
+            .map(|row| row.count)
+            .unwrap_or(0)
     }
 
     #[tokio::test]
@@ -695,6 +702,333 @@ mod tests {
                 })
                 .await
                 .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn auto_improve_telemetry_aggregate_counts_learning_activity_only() {
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let ws = store
+            .writer
+            .get_or_create_workspace("default")
+            .await
+            .unwrap();
+        let proj = store
+            .writer
+            .get_or_create_project(ws, "app", None)
+            .await
+            .unwrap();
+        let other = store
+            .writer
+            .get_or_create_project(ws, "other", None)
+            .await
+            .unwrap();
+
+        store
+            .writer
+            .upsert_page(sample_page(ws, proj, "notes/update.md", "old update"))
+            .await
+            .unwrap();
+        store
+            .writer
+            .upsert_page(sample_page(ws, proj, "procedures/patch.md", "old patch"))
+            .await
+            .unwrap();
+
+        let mut update = proposal(
+            "notes/update.md",
+            AutoImproveProposalOperation::Update,
+            "new update",
+        );
+        update.kind = "decision".into();
+        let mut patch = proposal(
+            "procedures/patch.md",
+            AutoImproveProposalOperation::Update,
+            "new patch",
+        );
+        patch.kind = "procedure".into();
+        patch.edit_mode = Some("patch".into());
+        patch.patch_json = Some(serde_json::json!([{ "op": "append", "content": "new" }]));
+        patch.expected_base_body_sha256 = Some(sha256("old patch"));
+
+        let staged = store
+            .writer
+            .stage_auto_improve_run(stage_input(
+                ws,
+                proj,
+                vec![
+                    proposal(
+                        "notes/pending.md",
+                        AutoImproveProposalOperation::Create,
+                        "pending",
+                    ),
+                    proposal(
+                        "notes/approved.md",
+                        AutoImproveProposalOperation::Create,
+                        "approved",
+                    ),
+                    proposal(
+                        "notes/rejected.md",
+                        AutoImproveProposalOperation::Create,
+                        "rejected",
+                    ),
+                    proposal(
+                        "notes/failed.md",
+                        AutoImproveProposalOperation::Create,
+                        "failed",
+                    ),
+                    proposal(
+                        "notes/conflict.md",
+                        AutoImproveProposalOperation::Create,
+                        "proposal",
+                    ),
+                    update,
+                    patch,
+                ],
+            ))
+            .await
+            .unwrap();
+        let approved_id = staged.proposal_ids[1];
+        let rejected_id = staged.proposal_ids[2];
+        let failed_id = staged.proposal_ids[3];
+        let conflict_id = staged.proposal_ids[4];
+        let actor = ActorContext::default();
+
+        store
+            .writer
+            .approve_auto_improve_proposal(ApproveAutoImproveProposal {
+                workspace_id: ws,
+                project_id: proj,
+                proposal_id: approved_id,
+                page: sample_page(ws, proj, "notes/approved.md", "approved"),
+                actor: actor.clone(),
+                author_id: None,
+                checkpoint: None,
+            })
+            .await
+            .unwrap();
+        store
+            .writer
+            .reject_auto_improve_proposal(RejectAutoImproveProposal {
+                workspace_id: ws,
+                project_id: proj,
+                proposal_id: rejected_id,
+                reason: "human rejected".into(),
+                actor: actor.clone(),
+                author_id: None,
+            })
+            .await
+            .unwrap();
+        store
+            .writer
+            .fail_auto_improve_proposal(FailAutoImproveProposal {
+                workspace_id: ws,
+                project_id: proj,
+                proposal_id: failed_id,
+                reason: "admission denied".into(),
+                actor: actor.clone(),
+                author_id: None,
+            })
+            .await
+            .unwrap();
+        store
+            .writer
+            .upsert_page(sample_page(ws, proj, "notes/conflict.md", "external"))
+            .await
+            .unwrap();
+        assert_eq!(
+            store
+                .writer
+                .approve_auto_improve_proposal(ApproveAutoImproveProposal {
+                    workspace_id: ws,
+                    project_id: proj,
+                    proposal_id: conflict_id,
+                    page: sample_page(ws, proj, "notes/conflict.md", "proposal"),
+                    actor: actor.clone(),
+                    author_id: None,
+                    checkpoint: None,
+                })
+                .await
+                .unwrap(),
+            ApproveAutoImproveProposalResult::Conflict
+        );
+
+        let mut curator_report = proposal(
+            "reports/curator.md",
+            AutoImproveProposalOperation::Create,
+            "curator",
+        );
+        curator_report.kind = "curator_report".into();
+        let mut telemetry_report = proposal(
+            "reports/auto-improve.md",
+            AutoImproveProposalOperation::Create,
+            "telemetry",
+        );
+        telemetry_report.kind = "auto_improve_report".into();
+        store
+            .writer
+            .stage_auto_improve_run(stage_input(
+                ws,
+                proj,
+                vec![curator_report, telemetry_report],
+            ))
+            .await
+            .unwrap();
+
+        let mut eval_rejections = stage_input(ws, proj, Vec::new());
+        eval_rejections.rejected_candidates_json = serde_json::json!([
+            {
+                "reason": "eval_gate_failed",
+                "target_path": "eval/repeat.md",
+                "kind": "note",
+                "operation": "create",
+                "edit_mode": "full_page",
+                "summary": "same eval failure"
+            },
+            {
+                "reason": "eval_gate_failed",
+                "target_path": "eval/repeat.md",
+                "kind": "note",
+                "operation": "create",
+                "edit_mode": "full_page",
+                "summary": "same eval failure"
+            },
+            {
+                "reason": "eval_gate_timeout",
+                "target_path": "eval/timeout.md",
+                "summary": "timeout"
+            },
+            {
+                "reason": "eval_gate_error",
+                "target_path": "eval/error.md",
+                "summary": "error"
+            }
+        ]);
+        store
+            .writer
+            .stage_auto_improve_run(eval_rejections)
+            .await
+            .unwrap();
+
+        store
+            .writer
+            .stage_auto_improve_run(stage_input(
+                ws,
+                other,
+                vec![proposal(
+                    "notes/other.md",
+                    AutoImproveProposalOperation::Create,
+                    "other",
+                )],
+            ))
+            .await
+            .unwrap();
+
+        let aggregate = store
+            .reader
+            .auto_improve_telemetry_aggregate(ws, proj, 0, 10)
+            .await
+            .unwrap();
+        assert_eq!(aggregate.run_count, 3);
+        assert_eq!(aggregate.runs_with_learning_proposals, 1);
+        assert_eq!(
+            telemetry_count(&aggregate.proposals_by_status, "pending"),
+            3
+        );
+        assert_eq!(
+            telemetry_count(&aggregate.proposals_by_status, "approved"),
+            1
+        );
+        assert_eq!(
+            telemetry_count(&aggregate.proposals_by_status, "rejected"),
+            1
+        );
+        assert_eq!(telemetry_count(&aggregate.proposals_by_status, "failed"), 1);
+        assert_eq!(
+            telemetry_count(&aggregate.proposals_by_status, "conflict"),
+            1
+        );
+        assert_eq!(
+            telemetry_count(&aggregate.proposals_by_operation, "create"),
+            5
+        );
+        assert_eq!(
+            telemetry_count(&aggregate.proposals_by_operation, "update"),
+            2
+        );
+        assert_eq!(
+            telemetry_count(&aggregate.proposals_by_edit_mode, "full_page"),
+            6
+        );
+        assert_eq!(
+            telemetry_count(&aggregate.proposals_by_edit_mode, "patch"),
+            1
+        );
+        assert_eq!(telemetry_count(&aggregate.proposals_by_kind, "note"), 5);
+        assert_eq!(telemetry_count(&aggregate.proposals_by_kind, "decision"), 1);
+        assert_eq!(
+            telemetry_count(&aggregate.proposals_by_kind, "procedure"),
+            1
+        );
+        assert_eq!(
+            telemetry_count(&aggregate.maintenance_proposals_by_kind, "curator_report"),
+            1
+        );
+        assert_eq!(
+            telemetry_count(
+                &aggregate.maintenance_proposals_by_kind,
+                "auto_improve_report"
+            ),
+            1
+        );
+        assert_eq!(
+            telemetry_count(&aggregate.rejections_by_reason, "human rejected"),
+            1
+        );
+        assert_eq!(
+            telemetry_count(&aggregate.rejections_by_reason, "admission denied"),
+            1
+        );
+        assert_eq!(
+            telemetry_count(
+                &aggregate.rejections_by_reason,
+                "target changed since proposal was staged"
+            ),
+            1
+        );
+        assert_eq!(
+            telemetry_count(&aggregate.rejections_by_reason, "eval_gate_failed"),
+            2
+        );
+        assert_eq!(
+            telemetry_count(&aggregate.rejections_by_reason, "eval_gate_timeout"),
+            1
+        );
+        assert_eq!(
+            telemetry_count(&aggregate.rejections_by_reason, "eval_gate_error"),
+            1
+        );
+        assert_eq!(
+            telemetry_count(&aggregate.rejected_targets, "eval/repeat.md"),
+            2
+        );
+        assert!(
+            aggregate
+                .repeated_rejection_fingerprints
+                .iter()
+                .any(|row| row.count == 2)
+        );
+
+        let other_aggregate = store
+            .reader
+            .auto_improve_telemetry_aggregate(ws, other, 0, 10)
+            .await
+            .unwrap();
+        assert_eq!(other_aggregate.run_count, 1);
+        assert_eq!(
+            telemetry_count(&other_aggregate.proposals_by_status, "pending"),
+            1
         );
     }
 
