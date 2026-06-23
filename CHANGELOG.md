@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.2.2] - 2026-06-23
+
 ### Fixed
 - Long-session consolidation now favors later same-session corrections when the
   observation projection cap forces sampling, and both consolidation prompts now
@@ -1352,7 +1354,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Consolidator used server startup default project instead of the
   session's actual project.
 
-[Unreleased]: https://github.com/akitaonrails/ai-memory/compare/v1.2.1...HEAD
+[Unreleased]: https://github.com/akitaonrails/ai-memory/compare/v1.2.2...HEAD
+[1.2.2]: https://github.com/akitaonrails/ai-memory/releases/tag/v1.2.2
 [1.2.1]: https://github.com/akitaonrails/ai-memory/releases/tag/v1.2.1
 [1.2.0]: https://github.com/akitaonrails/ai-memory/releases/tag/v1.2.0
 [1.1.3]: https://github.com/akitaonrails/ai-memory/releases/tag/v1.1.3
